@@ -55,4 +55,9 @@ export const KV = {
   feishu: { chats: record<Record<string, boolean>>('feishu-chats'), history: family<string, [chat: string]>('feishu-history:'),
     topics: family<Record<string, string>, [chat: string]>('feishu-history-threads:'),
     seen: family<string[], [thread: string]>('thread-seen:'), initialized: family<boolean, [thread: string]>('thread-initialized:') },
+  /**
+   * GitLab Source: the project read cursor set after a complete round, and per-Thread note checkpoints so a Thread's old notes
+   * are not received again when another note arrives.
+   */
+  gitlab: { since: record<string>('gitlab-since'), notes: family<string, [thread: string]>('gitlab-notes:') },
 }

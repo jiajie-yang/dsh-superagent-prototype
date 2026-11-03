@@ -151,7 +151,7 @@ Declared for every enabled Source and computed from the configuration and the or
 | `DSH_SUPERAGENT_GITLAB_NUMBER` | The IID when the Ticket started on GitLab, otherwise empty |
 | `DSH_SUPERAGENT_GITLAB_URL` | The web page of the originating Issue, merge request or note, otherwise empty |
 
-The token is intentionally not a worker variable. Workers need a separate credential path in a later round (for example a `glab` wrapper signed in to the bot account, or a narrow helper that calls the API). Until that exists, a worker can read the project and reason about the request but cannot push a branch or open a merge request on GitLab.
+The token is intentionally not a worker variable; DSH strips credential-shaped variables (`KEY`, `PASSWORD`, `SECRET`, `TOKEN`) from child environments, so it does not reach a worker's shell. Workers still need a separate credential path in a later round (for example a `glab` wrapper signed in to the bot account, or a narrow helper that calls the API). Until that exists, a worker can read the project and reason about the request but cannot push a branch or open a merge request on GitLab.
 
 ## 8. Configuration and network
 
@@ -201,6 +201,7 @@ Notes:
 - GitLab never needs to reach the DSH host in this round; connectivity is one-way, DSH → GitLab on 443.
 - Cursors compare ISO timestamps; the DSH host and GitLab should be time-synchronized.
 - Confidential Issues and merge requests are read when the token can see them. Filtering them out is an open decision.
+- The DSH service process and anything it starts can read its environment; run the service under a dedicated OS user and use a project-scoped token with the smallest role that can read and create notes.
 
 ## 9. Verification status
 

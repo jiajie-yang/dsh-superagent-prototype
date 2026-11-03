@@ -13,6 +13,8 @@ export const HEALTH_TEXT = {
   sourceOff: 'Off',
   feishuCliUnset: 'The Source is on, and its bot lark-cli is not set',
   feishuBotMissing: 'Waiting for the Feishu bot',
+  gitlabUnconfigured: 'The Source is on, and its instance URL or project is not set',
+  gitlabTokenUnset: 'The Source is on, and DSH_SUPERAGENT_GITLAB_TOKEN is not set',
   pollFailures: '{count} consecutive failed polls; last: {error}',
 } as const
 export type HealthCode = keyof typeof HEALTH_TEXT

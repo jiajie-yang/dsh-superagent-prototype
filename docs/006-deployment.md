@@ -2,6 +2,8 @@
 
 Use this guide to install, configure and operate dsh-superagent. It covers accounts, startup checks, upgrades and troubleshooting, building on [001 Domain model](001-domain.md) through [005 Panel](005-panel.md).
 
+Choose the repository provider first. The main walkthrough below uses GitHub; for GitLab, follow the complete [GitLab repository provider](#gitlab-repository-provider) walkthrough and its dedicated template. GitLab-only deployments do not need a GitHub account or `gh` login.
+
 ## What runs
 
 - **A dedicated DeepSeek Harness profile**, called `superagent` in this guide. Create it from the Web profile template. It loads the bundle and serves its panel on `127.0.0.1`. Keep it separate from the profile you work in: the plugin changes process-wide `PATH` and git settings, and its process needs independent restarts and upgrades.
@@ -272,3 +274,212 @@ Setup problems appear on the overview with a link to the fix, in the panel's lan
 | The log says the plugin is incompatible with the running dsh | Install a DeepSeek Harness version within the `engines.dsh` range |
 | The panel shows "Failed to load plugins" after a DeepSeek Harness upgrade | Restart the running instance |
 | Nothing happens after a mention | Check that the author is on the Source's allowed list, the Source is on, and processing is not paused. On GitHub, a mention added by editing an Issue's body is not received; mention the agent in a comment |
+
+## GitLab repository provider
+
+This walkthrough creates a GitLab-only profile named `gitlab-agent` on port `3084`. Replace the example instance, project, paths and base branch with yours. Use a new profile and state directory; keep an existing installation's configuration when upgrading.
+
+### 1. Prerequisites and agent identity
+
+Install the shared prerequisites listed above: Node.js, system pnpm, git, Python and tmux, plus a DSH version satisfying `engines.dsh` in `package.json`. Use `glab` instead of `gh`; verify `glab auth git-credential --help` works. Install git-lfs if the target repository needs it. Configure a usable model provider in the new DSH profile before requesting work; the main and Executor Sessions use its default model unless their settings specify another.
+
+Use a dedicated agent identity, either a dedicated user or the bot of a project access token. It needs Developer access or higher to the configured project, API read/write access for issues, comments and MRs, and HTTPS Git push access to work branches. A project access token with `api` and `write_repository` scopes can provide these capabilities. Keep its token in a private file owned by the service's OS user, outside the repository, state directory and generated worker files. Never put it in Source settings, a clone URL, shell arguments or chat.
+
+The deployment owns each instance's identity and credential file; Source only stores the wrapper's absolute path. For this `gitlab-agent` profile use `~/.config/dsh-superagent/gitlab-agent/glab/agent-token`. Other profiles on the same server must use their own wrapper, directory and token file (for example `review-agent/glab/agent-token`), as well as separate state directories and ports. These directories prevent accidental credential mixing; isolation from other processes running as the same OS user requires a dedicated OS account or container.
+
+Create or rotate the token using this hidden terminal prompt. It writes a mode-`0600` file by atomic replacement in a mode-`0700` directory, without including the token in command history:
+
+```sh
+python3 - <<'PY'
+import getpass, os, tempfile
+from pathlib import Path
+
+directory = Path.home() / '.config/dsh-superagent/gitlab-agent/glab'
+directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+directory.chmod(0o700)
+token = getpass.getpass('GitLab agent token: ').strip()
+if not token:
+    raise SystemExit('Token must not be empty')
+fd, temporary = tempfile.mkstemp(prefix='.agent-token-', dir=directory)
+try:
+    with os.fdopen(fd, 'w') as output:
+        output.write(token + '\n')
+    os.replace(temporary, directory / 'agent-token')
+finally:
+    if os.path.exists(temporary):
+        os.unlink(temporary)
+PY
+```
+
+Create an executable wrapper. First find the real glab executable with `command -v glab`, then replace `/absolute/path/to/glab` below and set both host values to the Source's HTTPS host. Keep both values identical:
+
+```sh
+mkdir -p ~/.local/bin
+cat > ~/.local/bin/glab-gitlab-agent <<'EOF'
+#!/bin/sh
+set -eu
+umask 077
+unset GITLAB_TOKEN GITLAB_ACCESS_TOKEN OAUTH_TOKEN CI_JOB_TOKEN GLAB_TOKEN
+export GLAB_CONFIG_DIR="$HOME/.config/dsh-superagent/gitlab-agent/glab/config"
+export GITLAB_HOST='gitlab.example.com'
+export GITLAB_API_HOST='gitlab.example.com'
+export GLAB_API_PROTOCOL=https GLAB_SKIP_TLS_VERIFY=false
+export GLAB_ENABLE_CI_AUTOLOGIN=false CI=true GLAB_USE_KEYRING=false GLAB_IS_OAUTH2=false
+token_file="$HOME/.config/dsh-superagent/gitlab-agent/glab/agent-token"
+if [ ! -f "$token_file" ] || [ ! -r "$token_file" ]; then
+  echo 'GitLab agent token file is missing or unreadable' >&2
+  exit 1
+fi
+if ! GITLAB_TOKEN=$(cat "$token_file") || [ -z "$GITLAB_TOKEN" ]; then
+  echo 'GitLab agent token file is empty or unreadable' >&2
+  exit 1
+fi
+export GITLAB_TOKEN
+exec '/absolute/path/to/glab' "$@"
+EOF
+chmod 700 ~/.local/bin/glab-gitlab-agent
+~/.local/bin/glab-gitlab-agent api --hostname gitlab.example.com user --jq '{id, username, email}'
+~/.local/bin/glab-gitlab-agent api --hostname gitlab.example.com 'projects/group%2Fsubgroup%2Frepository'
+```
+
+The wrapper loads the token for every invocation, including workers' Git credential helper. Missing, unreadable or empty files stop before glab runs; an expired/revoked token fails authentication without falling back to a personal login. The pinned API host, protocol and TLS verification override ambient variables and glab configuration. Keep any required proxy and corporate CA configuration; do not disable TLS verification. The wrapper's `CI=true`, disabled CI auto-login and disabled keyring are scoped to its child process, not the whole DSH service. The example was checked with glab `1.118.0`; recheck API, MR, discussion and Git helper behavior when upgrading glab.
+
+Do not run agent-side `auth login` or `auth logout`. glab's keyring entries can be shared by host even across different configuration directories. This workflow supplies a token directly and does not migrate, overwrite or delete existing personal/legacy credentials. When adopting it, provision the agent's token file explicitly; do not automatically export or clean up old logins.
+
+For rotation, wait for idle and stop the service, rerun the hidden prompt to atomically replace the file, and verify `/user` and the project with the wrapper before restarting. Retain the same numeric agent ID for an existing state directory; a new project-token bot may have a different ID and need new state. For local removal, stop the service and remove only that instance's token file. Local deletion does **not** revoke the token: revoke it separately in GitLab when no longer needed. Do not use `auth logout` as token-file cleanup.
+
+Confirm the returned user is the agent and has an email. The project must have a clone URL on the same instance and project or group access level at least `30`. Setup checks these facts; it does not prove pushes to protected branches will succeed. Workers run with the operator's OS permissions, as described under [Permissions and isolation](#permissions-and-isolation).
+
+### 2. Install and copy the GitLab template
+
+Run from this source checkout, using the system pnpm. If DSH is not installed, install the version described under [Install](#install) first.
+
+```sh
+pnpm install --frozen-lockfile
+pnpm check
+dsh --profile gitlab-agent --from-default-profile web --dump-config > /dev/null
+dsh plugin --profile gitlab-agent add "link:$PWD"
+cp examples/profile.gitlab.cordis.patch.yml \
+  "${DSH_HOME:-$HOME/.dsh}/profiles/gitlab-agent/cordis.patch.yml"
+```
+
+The profile-creation and template-copy commands above are for a **new installation only**. `--from-default-profile` replaces an existing profile, including its user configuration; do not use it for upgrades.
+
+Edit the copied [GitLab template](../examples/profile.gitlab.cordis.patch.yml): replace its `stateDir` placeholder with a new absolute path, such as `/home/me/.dsh/state/gitlab-agent`, and choose an unused port. It already sets `repositoryProvider: gitlab`, enables `dsh-superagent-gitlab` and disables the GitHub and Feishu Sources. Leave the bundle's router and worker presets installed.
+
+Only machine configuration and plugin enablement belong in this file. Configure the instance, project, CLI, Policy and Execution through the Superagent panel. Feishu can be enabled and configured separately later.
+
+### 3. Start and configure the Source
+
+Start in the foreground first:
+
+```sh
+dsh --profile gitlab-agent --no-open
+```
+
+Open the full URL DSH prints, then **Superagent** in the sidebar. Waiting for setup on the first start is expected. Configure the profile's model provider and default model if not already available.
+
+In **Sources → GitLab**, enable the Source and set:
+
+| Field | Example |
+| --- | --- |
+| `baseUrl` | `https://gitlab.example.com` — HTTPS origin only, without a project path or `/api/v4` |
+| `project` | `group/subgroup/repository` — a path, not a URL |
+| `cli` | `/home/me/.local/bin/glab-gitlab-agent` — the wrapper's absolute path |
+| `pollSeconds` | `60` by default; supported range `30`–`3600` |
+| `receiveAllIssues`, `receiveAllMergeRequests`, `receiveAllComments` | Keep all off for the first deployment |
+
+Saving account fields checks them and may restart Superagent. Wait for its API to answer again before saving the next block. For API-driven setup, read `GET settings` again and use the current block revision; preserve other fields when saving a whole block.
+
+The first successful setup binds the state directory to the instance, numeric project ID and agent ID. Changing those requires a new state directory, even when previous tickets have ended. Credential rotation for the same identity is allowed. Do not reuse an existing GitHub state directory with ticket/event/session history.
+
+### 4. Configure execution before allowing requests
+
+Prepare a dedicated local clone. This example selects the agent helper only for the clone command, without modifying your global git configuration. Replace `/home/me`, the URL and destination:
+
+```sh
+mkdir -p /home/me/src
+git -c credential.helper= \
+  -c 'credential.helper=!/home/me/.local/bin/glab-gitlab-agent auth git-credential' \
+  clone https://gitlab.example.com/group/subgroup/repository.git /home/me/src/repository-agent
+```
+
+Keep credentials and `http.*.extraheader` out of the clone's local `.git/config`; worker git uses the agent's generated HTTPS helper. Prepare the project's test tools and dependencies too: a working clone alone does not make tests runnable.
+
+In **Execution**, start with `maxWorkers: 1`, leave the directory root empty to use `<stateDir>/work`, and use a Prepare command like this. Replace the clone path and `main` with your intended base branch:
+
+```sh
+set -eu
+repo='/home/me/src/repository-agent'
+if [ -e "$DSH_SUPERAGENT_DIR/.git" ]; then
+  exit 0
+fi
+git -C "$repo" fetch --no-tags origin \
+  "refs/heads/main:refs/dsh-superagent/$DSH_SUPERAGENT_TICKET"
+git -C "$repo" worktree add -b "agent/$DSH_SUPERAGENT_NAME" \
+  "$DSH_SUPERAGENT_DIR" "refs/dsh-superagent/$DSH_SUPERAGENT_TICKET"
+```
+
+Each Ticket receives its own worktree and branch. A new MR-origin task may require the Executor to inspect or check out the MR's branch explicitly; this example prepares the configured base branch. Workers use the dedicated `glab` shim and report their MR with `mr_iid`.
+
+Review **Prompts → Delivery requirements**: use the agent's verified email and intended commit author, name the target branch and required project checks, retain the automation disclosure, and require human merge. GitLab defaults already use glab and manual merge; no GitHub auto-merge account is needed. Keep the default `observe` mode initially. It limits inferred work; **allowed users' explicit requests still execute**, so add the allowed list after execution setup is ready.
+
+### 5. Configure the allowed users
+
+In **Policy → GitLab → allowed users**, add the **people who may request work**, not the agent itself. A row's `id` must be `encodeURIComponent(baseUrl):numeric-user-id`. A username or a bare number is not this identity; `name` is optional display text and does not grant access.
+
+To find your own numeric ID, use your **personal** glab login, not `glab-gitlab-agent`. Confirm its returned username is yours:
+
+```sh
+glab api --hostname gitlab.example.com user --jq '{id, username}'
+```
+
+For another person, obtain and verify their numeric user ID on this instance. Replace the URL and `123` in this command to generate the exact value to paste. Use the same instance as the Source; `origin` removes a trailing slash:
+
+```sh
+node -e '
+const [baseUrl, userId] = process.argv.slice(1)
+console.log(encodeURIComponent(new URL(baseUrl).origin) + ":" + userId)
+' https://gitlab.example.com 123
+```
+
+Output: `https%3A%2F%2Fgitlab.example.com:123`. Paste this entire string into the ID column. This is the existing identity format; generating it does not change the stored Policy or automatically grant anyone access.
+
+Leave **candidate bots** empty unless messages from another bot should become inferred candidates. That list uses the same ID format and does not let bots make explicit requests. It is not where the agent's own account or human operators belong.
+
+### 6. Verify, then run in the background
+
+```sh
+curl --fail --silent --show-error -H 'x-orchestrator-request: 1' \
+  http://127.0.0.1:3084/orchestrator/api/state
+curl --fail --silent --show-error -H 'x-orchestrator-request: 1' \
+  http://127.0.0.1:3084/orchestrator/api/sources
+```
+
+Expect `setup.problem: null`, runtime and GitLab health `ready`, only the GitLab Source installed/enabled for a fresh GitLab-only profile, and no running or queued work before the test. A model must be usable, not merely named in configuration.
+
+Wait for the first successful GitLab poll, then from an allowed person's account post a **new** Issue/MR or comment mentioning `@<agent username>` with a small, specific task, its required checks and target branch. Ask for an MR without merging it. The first scan establishes a current-time baseline rather than importing all old messages. Edits without a verified editor are context only and cannot authorize new work as the original author; use a new comment for the test. The agent ignores its own messages.
+
+Verify the Ticket, worktree, execution Session, actual checks and MR creation. Add a new review discussion on the bound MR without mentioning the agent to check follow-up, then merge manually and verify the Ticket ends as `merged`. Pipeline feedback is context for an existing ticket, not an independent request.
+
+After foreground verification, press Ctrl+C and wait for DSH to exit before starting a background instance:
+
+```sh
+tmux new-session -d -s dsh-gitlab-agent -n server 'dsh --profile gitlab-agent --no-open'
+tmux attach -t dsh-gitlab-agent
+```
+
+Detach with Ctrl+B, then D. Stop by attaching and pressing Ctrl+C; wait for exit before restarting. On hosts where the [service script](#start-and-stop) recognizes DSH, it can instead be used with `--profile gitlab-agent --url http://127.0.0.1:3084`. The macOS Electron-hosted DSH used in integration exposed `ps` decoding and process-name recognition limitations in that script. Use direct startup/tmux and the HTTP checks there; do not enable its automatic recovery until process detection works on your host.
+
+For upgrades, wait for idle, stop gracefully and back up the state directory, rebuild the checkout with system pnpm, then start the existing profile again. Do not recreate its profile or replace its user patch with the template. Recheck runtime/GitLab health and existing Ticket state.
+
+| Symptom | Check |
+| --- | --- |
+| GitLab setup fails | Instance wrapper executable, private nonempty token file and its permissions, `/user` identity/email, pinned HTTPS API host, project path, same-host clone URL and Developer access |
+| API reads succeed but a push fails | Token's Git write capability and branch protection; setup does not prove actual delivery |
+| Mention produces no Ticket | Correct person's full encoded ID, new message after the first poll, Source enabled, processing not paused |
+| Prepare fails | Clone path, base branch, local credentials/extraheaders and project prerequisites; correct the command before retrying |
+| State directory binding fails | Use a new directory for another instance, project or agent identity |
+| Management API disappears after unexpected initialization failure | The failed Runtime withdraws its service and cleans resources; fix the cause and restart the main plugin through DSH's Plugin Manager or restart the profile |
+
+One state directory serves one HTTPS instance and one project, including nested groups. Configuring your fork as that project is supported; cross-project fork MR execution, default-branch CI proactive work, Webhooks, multi-project dispatch and automatic merge are not. Polling scans full paginated project objects and discussions, with subscriptions first; increase the interval for larger projects. Failed reads retain the relevant cursors. Local fixture checks do not certify every GitLab version: complete real-instance discussion, push and merge checks on your target installation.

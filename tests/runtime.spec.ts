@@ -908,6 +908,26 @@ it('lets only the panel change the execution environment, since it decides what 
   expectTypeOf(runtime.settings.pause).parameter(1).toEqualTypeOf<SettingsOrigin>()
 })
 
+it.each(['unbound state', 'legacy GitHub binding'])('keeps GitHub repository and account changes working with %s', async mode => {
+  expect(runtime.store.get(KV.store.binding)).toBeUndefined()
+  if (mode === 'legacy GitHub binding') runtime.store.set(KV.store.binding, {
+    provider: 'github', instance: 'https://github.com', projectId: 'acme/widgets', agentId: 'agent-bot',
+  })
+  const binding = runtime.store.get(KV.store.binding)
+  answers[`${OTHER()} api user`] = '{"login":"another-agent","id":8}'
+  answers[`${OTHER()} api repos/acme/another --jq {name: .full_name, push: .permissions.push}`] = '{"name":"acme/another","push":true}\n'
+  const config = { ...runtime.store.settings().sources.github!.config, repository: 'acme/another', cli: OTHER() }
+  expect(await runtime.settings.save('source:github', { enabled: true, config }, runtime.store.blockRevision('source:github'), 'panel'))
+    .toMatchObject({ saved: true, restarting: true })
+  await vi.waitFor(() => expect(restarts).toHaveBeenCalledOnce())
+  answers[HELPERS] = `file:${workerGitConfig(directory)}\0${credentialHelper(OTHER())}\0`
+  const next = await restart({}, { github: { repository: 'acme/another', cli: OTHER() } })
+  await next.ready
+  expect(next.configured()).toBe(true)
+  expect(next.deployment).toMatchObject({ repository: 'acme/another', github: { login: 'another-agent', cli: OTHER() } })
+  expect(next.store.get(KV.store.binding)).toEqual(binding)
+})
+
 it('checks a changed account CLI before saving it, restarts after the save, and lets only the panel change it', async () => {
   const save = (config: Record<string, unknown>, origin: SettingsOrigin = 'panel') => runtime.settings.save('source:github',
     { enabled: true, config: { ...runtime.store.settings().sources.github!.config, ...config } }, runtime.store.blockRevision('source:github'), origin)
@@ -974,12 +994,12 @@ it('runs setup again while the Feishu bot check failed, and restores the process
 
 it('writes worker shims and the agent environment from the configuration only, and restores the environment on stop', async () => {
   const bin = join(directory, 'worker-bin')
-  expect(readdirSync(bin).sort()).toEqual(['gh', 'lark-cli'])
+  expect(readdirSync(bin).sort()).toEqual(['gh', 'glab', 'lark-cli'])
   expect(readFileSync(join(bin, 'lark-cli'), 'utf8')).toContain(`exec '${BOT()}'`)
   runtime.store.saveSettings({ ...runtime.store.settings(), executor: { ...runtime.store.settings().executor, blockedCommands: ['personal-gh'] } })
   const next = await restart({}, { feishu: null })
   await next.ready
-  expect(readdirSync(bin).sort()).toEqual(['gh', 'lark-cli', 'personal-gh'])
+  expect(readdirSync(bin).sort()).toEqual(['gh', 'glab', 'lark-cli', 'personal-gh'])
   expect(readFileSync(join(bin, 'personal-gh'), 'utf8')).toContain('personal-gh is blocked in this installation; use gh, which acts as agent-bot.')
   expect(readFileSync(join(bin, 'lark-cli'), 'utf8')).toContain('lark-cli is unavailable: this installation has no Feishu bot.')
   expect(readFileSync(join(bin, 'gh'), 'utf8')).toContain(`exec '${AGENT()}'`)
@@ -1006,9 +1026,9 @@ it('rewrites the blocked-command shims when the Executor settings change them, w
   const bin = join(directory, 'worker-bin')
   const save = (blockedCommands: string[]) => runtime.settings.save('executor', { ...runtime.store.settings().executor, blockedCommands }, runtime.store.blockRevision('executor'), 'panel')
   expect(await save(['personal-gh'])).toMatchObject({ saved: true, restarting: false })
-  expect(readdirSync(bin).sort()).toEqual(['gh', 'lark-cli', 'personal-gh'])
+  expect(readdirSync(bin).sort()).toEqual(['gh', 'glab', 'lark-cli', 'personal-gh'])
   await save([])
-  expect(readdirSync(bin).sort()).toEqual(['gh', 'lark-cli'])
+  expect(readdirSync(bin).sort()).toEqual(['gh', 'glab', 'lark-cli'])
   // The commands workers need cannot be blocked.
   await expect(save(['gh'])).rejects.toThrow()
   expect(restarts).not.toHaveBeenCalled()

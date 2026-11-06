@@ -13,7 +13,7 @@ import { SourceRegistry } from '../src/sources/registry.ts'
 
 /** Assessor fixture backed by in-memory repositories and fake GitHub Issue and file reads. */
 function setup(strength: 'explicit' | 'inferred' = 'inferred', bodies = Array.from({ length: 5 }, (_, i) => `comment ${i}`),
-  threadContext?: AssessorHost['threadContext']) {
+  threadContext?: AssessorHost['threadContext'], provider: 'github' | 'gitlab' = 'github') {
   const comments = bodies.map((body, i) => ({ id: i, html_url: `https://github.com/acme/widgets/issues/1#c${i}`,
     user: { login: 'bob' }, created_at: '2026-09-09T00:00:00Z', body }))
   const gate = { issue: undefined as Promise<void> | undefined }
@@ -37,7 +37,7 @@ function setup(strength: 'explicit' | 'inferred' = 'inferred', bodies = Array.fr
   sources.register(githubKind)
   let engine!: Engine
   const host: AssessorHost = {
-    get engine() { return engine }, commands, deployment: testDeployment(), settings: () => SettingsSchema.parse({}),
+    get engine() { return engine }, commands, deployment: testDeployment({ repositoryProvider: provider }), settings: () => SettingsSchema.parse({}),
     threadContext: threadContext ?? (trigger => sources.threadContext(trigger)),
     effects: { enqueue: () => {}, handle: () => {} }, paused: () => false, deliver: async () => {}, candidateCard: async candidate => ({ eval_id: candidate.evalId }),
   }
@@ -57,7 +57,7 @@ function setup(strength: 'explicit' | 'inferred' = 'inferred', bodies = Array.fr
   // Per-Eval state retained by the assessor and released when the Eval ends.
   const kept = assessor as unknown as { evals: Map<string, unknown> }
   const size = () => kept.evals.size
-  return { repo, engine, assessor, tools, size, gate }
+  return { repo, engine, assessor, tools, size, gate, commands }
 }
 const issue = (n: number): Trigger => ({ id: `issue-${n}`, source: 'github', threads: [{ source: 'github', id: String(n) }], actor: { source: 'github', id: 'bob' }, human: true,
   at: new Date(Date.UTC(2026, 8, 9, 0, 0, n)).toISOString(), text: `issue ${n}`, url: `https://github.com/acme/widgets/issues/${n}`, meta: { number: n } })
@@ -180,4 +180,24 @@ it('lets the main Session read on from the cursor its loaded window ends with, a
   s2.engine.receive(long); s2.engine.receive({ ...issue(3), threads: issue(1).threads }); s2.engine.evaluateDue()
   const other = await s2.assessor.context('issue-3', signal) as { batch: Record<string, unknown>[] }
   expect(other.batch).toEqual([expect.objectContaining({ trigger_id: 'long', chars: long.text.length, read: 'trigger/long' })])
+})
+
+
+it('serves GitLab default-branch files and paginated directories through orchestrator_eval_read with source-path restrictions', async () => {
+  const s = setup('inferred', [], () => undefined, 'gitlab')
+  const api = vi.fn(async (path: string) => {
+    if (path === 'repository/files/src%2Fvalue.ts?ref=HEAD') return { encoding: 'base64', content: Buffer.from('export const value = 42').toString('base64') }
+    if (path.includes('page=2')) return [{ name: 'last.ts' }]
+    return [{ name: '.secret' }, { name: 'node_modules' }, ...Array.from({ length: 98 }, (_, i) => ({ name: `file${i}.ts` }))]
+  })
+  s.commands.gitlab = api as Commands['gitlab']
+  const github = vi.spyOn(s.commands, 'api')
+  s.engine.receive(issue(1)); s.engine.evaluateDue()
+  const read = (resource: 'file' | 'directory', path: string) => s.tools.orchestrator_eval_read!({ trigger_id: 'issue-1', resource, path, offset: 0 }, signal)
+  expect(await read('file', 'src/value.ts')).toMatchObject({ text: 'export const value = 42' })
+  const listing = await read('directory', 'src') as { text: string }
+  expect(listing.text).toContain('last.ts'); expect(listing.text).not.toContain('.secret'); expect(listing.text).not.toContain('node_modules')
+  expect(api).toHaveBeenCalledWith('repository/tree?path=src&per_page=100&page=2')
+  for (const path of ['../secret', '.env', 'node_modules/x', 'src/../../secret']) await expect(read('file', path)).rejects.toThrow('non-hidden')
+  expect(github).not.toHaveBeenCalled()
 })

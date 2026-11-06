@@ -98,7 +98,7 @@ function setupView(runtime: HttpHost) {
   const resolved = runtime.configured() ? runtime.deployment : undefined
   return {
     machine: machineView(runtime.machine), problem: runtime.setupProblem ?? null, feishuProblem: runtime.feishuProblem ?? null,
-    accounts: resolved ? { repository: resolved.repository, agent: resolved.github.login, feishu: resolved.feishu ? { appId: resolved.feishu.appId, brand: resolved.feishu.brand, botId: resolved.feishu.botId, name: resolved.feishu.name } : null } : null,
+    accounts: resolved ? { repository: resolved.repository, agent: resolved.gitlab?.username ?? resolved.github?.login ?? '', feishu: resolved.feishu ? { appId: resolved.feishu.appId, brand: resolved.feishu.brand, botId: resolved.feishu.botId, name: resolved.feishu.name } : null } : null,
   }
 }
 /** Build the `/orchestrator/api/state` response consumed by the management panel and `scripts/dsh-superagent status` (`docs/006-deployment.md`). */
@@ -124,8 +124,8 @@ function promptsView(runtime: HttpHost, revision: number | undefined, offset: nu
   const shown = revision === undefined || revision === current.revision ? current : runtime.prompts.version(revision)
   // Each built-in part with the key of its text, which an override records as its base, and for the overrides shown whose
   // built-in text changed since, the text they were edited from when known.
-  const parts = Object.entries(builtInParts()).map(([key, part]) => ({ key, ...part, base: builtInBase(part.text) }))
-  return { masterId: runtime.masterId, current: shown, defaults: defaultPrompts(), sections: TEAM_SECTIONS, skillName: SKILL_NAME.source,
+  const parts = Object.entries(builtInParts(runtime.machine.repositoryProvider)).map(([key, part]) => ({ key, ...part, base: builtInBase(part.text) }))
+  return { masterId: runtime.masterId, current: shown, defaults: defaultPrompts(runtime.machine.repositoryProvider), sections: TEAM_SECTIONS, skillName: SKILL_NAME.source,
     builtin: Object.keys(sourceSkills), skillPrefix: SKILL_PREFIX, parts, defaultChanged: runtime.prompts.defaultChanged(shown.config),
     ...runtime.sessions.status(), ...runtime.prompts.history(offset) }
 }

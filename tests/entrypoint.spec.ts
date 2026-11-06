@@ -3,6 +3,7 @@ import { Context } from '@deepseek-ai/cordis'
 import { afterEach, expect, it, vi } from 'vitest'
 import * as entrypoint from '../src/index.ts'
 import * as github from '../src/sources/github.ts'
+import * as gitlab from '../src/sources/gitlab.ts'
 import { SourceRegistry } from '../src/sources/registry.ts'
 import { SettingsSchema } from '../src/policy.ts'
 import type { SourceContext } from '../src/sources/host.ts'
@@ -36,21 +37,21 @@ afterEach(async () => {
   for (const ctx of contexts.splice(0)) await ctx.fiber.dispose()
   lifecycle.instances = []
 })
-function mount(withSource = true) {
+function mount(withSource = true, plugin: typeof github | typeof gitlab = github) {
   const ctx = new Context(); contexts.push(ctx)
   const logs: { type: string; args: unknown[] }[] = []
   ctx.logger.exporter({ export: message => { logs.push(message) } })
   for (const name of entrypoint.inject) ctx.reflect.provide(name, {} as never)
   const main = ctx.plugin(entrypoint, { stateDir: '/tmp/entrypoint-regression' })
-  const source = withSource ? ctx.plugin(github) : undefined
+  const source = withSource ? ctx.plugin(plugin) : undefined
   return { ctx, main, source, logs }
 }
 
-it('publishes the orchestrator and registers the real Source before readiness, then cleans up on unload', async () => {
-  const { ctx, main, source, logs } = mount()
+it.each([['github', github], ['gitlab', gitlab]] as const)('publishes the orchestrator and registers the real %s Source before readiness, then cleans up on unload', async (id, plugin) => {
+  const { ctx, main, source, logs } = mount(true, plugin)
   await main; await source
   const runtime = lifecycle.instances[0]!
-  expect(runtime.sources.kind('github')).toBeDefined()
+  expect(runtime.sources.kind(id)).toBeDefined()
   expect(ctx.get('orchestrator')).toBeDefined()
   expect(logs.some(log => String(log.args[0]).includes('dsh-superagent ready;'))).toBe(false)
   runtime.finish()
@@ -58,7 +59,7 @@ it('publishes the orchestrator and registers the real Source before readiness, t
   await main.dispose()
   expect(runtime.stop).toHaveBeenCalledOnce()
   expect(ctx.get('orchestrator')).toBeUndefined()
-  expect(runtime.sources.kind('github')).toBeUndefined()
+  expect(runtime.sources.kind(id)).toBeUndefined()
 })
 
 it('logs rejected readiness, withdraws the service and Source, and allows the outer entry to restart', async () => {

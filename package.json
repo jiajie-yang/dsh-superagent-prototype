@@ -4,7 +4,7 @@
   "license": "MIT",
   "version": "0.1.0",
   "private": true,
-  "description": "A proactive agent for one GitHub repository, as a DSH (DeepSeek Harness) bundle: it listens to GitHub and optionally Feishu, evaluates requests under a Policy, turns authorized ones into Tickets, and executes each in its own DSH Session.",
+  "description": "A proactive agent for one GitHub or GitLab repository, as a DSH (DeepSeek Harness) bundle: it listens to the selected repository provider and optionally Feishu, evaluates requests under a Policy, turns authorized ones into Tickets, and executes each in its own DSH Session.",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
@@ -14,6 +14,7 @@
       "default": "./lib/index.js"
     },
     "./client": "./lib/client.js",
+    "./gitlab-watch": "./lib/gitlab-watch.js",
     "./github-watch": "./lib/github-watch.js",
     "./feishu-watch": "./lib/feishu-watch.js",
     "./package.json": "./package.json",

@@ -20,7 +20,11 @@ export function family<V, A extends unknown[] = [string]>(prefix: string, format
 
 export const KV = {
   /** Store: current database schema version. */
-  store: { schema: record<number>('schema') },
+  gitlab: { since: record<string>('gitlab-since'), baseline: record<string>('gitlab-baseline'),
+    cursor: family<string, [object: string]>('gitlab-cursor:'),
+    body: family<{ hash: string; revision: number; updatedAt: string }, [object: string]>('gitlab-body:'),
+    ci: family<{ fingerprint: string; revision: number }, [object: string]>('gitlab-ci:') },
+  store: { schema: record<number>('schema'), binding: record<{ provider: string; instance: string; projectId: string; agentId: string }>('repository-binding') },
   /** Settings: current revision, per-block revision, and saved settings snapshots (including the current one). */
   settings: { revision: record<number>('settings-revision'),
     block: family<number, [block: SettingsSave]>('settings-block-revision:'),

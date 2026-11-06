@@ -1,12 +1,45 @@
 // @vitest-environment jsdom
 // The Eval status and settings.
 import { act } from 'react'
-import { expect, it } from 'vitest'
+import { createRoot } from 'react-dom/client'
+import { expect, it, vi } from 'vitest'
 import { en, zh } from '../src/client/locales.ts'
-import { usePanel, mount, remount, settle, all, find, tab, click, type, text, field } from './fixtures/panel.tsx'
+import { PanelProvider } from '../src/client/provider.tsx'
+import { SourceField } from '../src/client/settings-kit.tsx'
+import { gitlabKind } from '../src/sources/gitlab.ts'
+import { usePanel, mount, remount, settle, all, find, tab, click, type, text, field, translator } from './fixtures/panel.tsx'
 import { server } from './fixtures/panel-server.ts'
 
 usePanel()
+it.each([['zh', zh], ['en', en]] as const)('shows GitLab identity hints in the existing row editor without changing IDs (%s)', async (lang, dictionary) => {
+  const container = document.createElement('div'); document.body.append(container)
+  const root = createRoot(container), changed = vi.fn()
+  const id = 'https%3A%2F%2Fgitlab.example.com:123'
+  const allowed = gitlabKind.policy!.fields.find(field => field.key === 'allowed')!
+  const bots = gitlabKind.policy!.fields.find(field => field.key === 'bots')!
+  try {
+    await act(async () => { root.render(<PanelProvider t={translator(dictionary)}>
+      <SourceField field={allowed} value={[{ id, name: 'Alice' }]} saved={[]} fact={undefined} onChange={changed} labels={{}} />
+      <SourceField field={bots} value={[]} saved={[]} fact={undefined} onChange={() => {}} labels={{}} />
+    </PanelProvider>) })
+    await settle()
+    const hints = [...container.querySelectorAll<HTMLButtonElement>('.dt-info')]
+    expect(hints).toHaveLength(2)
+    await act(async () => { hints[0]!.dispatchEvent(new MouseEvent('mouseover', { bubbles: true })) })
+    const tooltip = document.querySelector('[role="tooltip"]')!
+    expect(tooltip.textContent).toContain(id)
+    expect(tooltip.textContent).toContain(lang === 'zh' ? '不要填写智能体账号、用户名或裸数字' : 'not the agent account, a username or a bare number')
+    expect(tooltip.textContent).toContain(lang === 'zh' ? '名字仅用于显示，不参与授权' : 'display only, not authorization')
+    expect(hints[1]!.getAttribute('aria-label')).toContain(lang === 'zh' ? '不能发起明确任务' : 'cannot make explicit requests')
+    const inputs = container.querySelectorAll<HTMLInputElement>('input')
+    expect(inputs[0]!.value).toBe(id)
+    await type(inputs[1]!, 'Operator')
+    expect(changed).toHaveBeenLastCalledWith([{ id, name: 'Operator' }])
+  } finally {
+    act(() => { root.unmount() }); container.remove()
+  }
+})
+
 it('opens the Decisions under Policy from the flow line with their reasons, Decisions that start work first, filterable by kind',
   async () => {
   await mount()

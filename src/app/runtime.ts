@@ -201,13 +201,16 @@ export class Runtime extends Service implements SourceHost {
   private async initialize(): Promise<void> {
     // Register management HTTP routes before setup completes so operators can fix setup problems in the UI.
     this.disposers.push(registerHttp(this.ctx, this.httpHost()))
-    if (!await this.setup.run(this.store.settings())) {
+    const configured = await this.setup.run(this.store.settings())
+    if (this.closing()) return
+    if (!configured) {
       this.runtimeHealth.set({ ...health('paused', 'setupPending'), at: now() })
       return
     }
     this.sessions.install()
     this.executor.install()
     await this.sessions.ensure(this.masterId, this.machine.stateDir, 'dsh-superagent orchestrator', 'orchestrator')
+    if (this.closing()) return
     for (const id of this.settings.syncable()) await this.settings.sync(id).catch(() => { /* sync() records its failure in health. */ })
     // If stop() was called while awaiting setup, session creation, or policy sync, do not start background loops.
     if (this.closing()) return
@@ -231,6 +234,8 @@ export class Runtime extends Service implements SourceHost {
     this.closingFlag = true; const passes = this.passes.stop(); this.stopped.abort()
     try {
       this.assessor.stop()
+      // In-flight initialization may still use the store or install the process environment.
+      await this.ready.catch(() => {})
       const ids = [this.masterId, ...this.store.tickets.list().map(ticket => workerSessionId(ticket.id))]
       const agents = ids.map(id => this.ctx.agents.get(id as SessionId)).filter((agent): agent is Agent => agent !== undefined)
       for (const agent of agents) agent.cancel({ kind: 'user' }, { keepInbox: true })

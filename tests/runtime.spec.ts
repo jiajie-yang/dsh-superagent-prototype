@@ -8,6 +8,8 @@ import { afterEach, beforeEach, describe, expect, expectTypeOf, it, vi } from 'v
 import type { UserMessage } from '@deepseek-ai/dsh-llm'
 import { renderPrompt } from '@deepseek-ai/dsh-system-prompt'
 import { Runtime } from '../src/app/runtime.ts'
+import { Setup } from '../src/app/setup.ts'
+import { deferred } from './fixtures/async.ts'
 import { jobRegistry } from './fixtures/host.ts'
 import { evalsHealth } from '../src/app/views/overview.ts'
 import { mandateInstructions } from '../src/executor/dsh.ts'
@@ -1793,4 +1795,66 @@ it('keeps the Policy the main Session judges by in its prompt, after admission a
   await runtime.settings.save('policy', { ...saved.policy, rules: rules.map(rule => ({ ...rule, enabled: false })) }, runtime.store.blockRevision('policy'), 'panel')
   expect(policy()).toContain('No rule is enabled: a proactive candidate can only be ignored.')
   expect(policy()).toContain('The accept mode and the rules decide proactive candidates only')
+})
+
+it('cleans up an asynchronous initialization failure and can reopen the same state directory', async () => {
+  await runtime.stop()
+  const previous = { git: process.env.GIT_CONFIG_GLOBAL, path: process.env.PATH }
+  const failure = new Error('Cannot initialize the master Session')
+  controller.resolveAgent.mockRejectedValueOnce(failure)
+  const next = await restart()
+  const close = vi.spyOn(next.store, 'close'), restore = vi.spyOn(next.setup, 'restore')
+  await expect(next.ready).rejects.toBe(failure)
+  expect(process.env.GIT_CONFIG_GLOBAL).toBe(workerGitConfig(directory))
+  const stopping = next.stop()
+  expect(next.stop()).toBe(stopping)
+  await stopping
+  expect(close).toHaveBeenCalledOnce(); expect(restore).toHaveBeenCalledOnce()
+  expect(process.env.GIT_CONFIG_GLOBAL).toBe(previous.git); expect(process.env.PATH).toBe(previous.path)
+  const recovered = await restart()
+  await recovered.ready
+  expect(recovered.health.runtime?.state).toBe('ready')
+})
+
+it.each(['setup', 'master Session'] as const)('waits for in-flight %s initialization before closing resources on unload', async phase => {
+  await runtime.stop()
+  const previous = { git: process.env.GIT_CONFIG_GLOBAL, path: process.env.PATH }
+  const entered = deferred(), release = deferred()
+  if (phase === 'setup') {
+    const run = Setup.prototype.run
+    vi.spyOn(Setup.prototype, 'run').mockImplementationOnce(async function (this: Setup, settings) {
+      entered.resolve(); await release.promise
+      return run.call(this, settings)
+    })
+  } else {
+    controller.resolveAgent.mockImplementationOnce(async (id: string) => {
+      entered.resolve(); await release.promise
+      return agents.has(id) ? { agent: agents.get(id) } : { error: { code: 'session/not-found' } }
+    })
+  }
+  const next = await restart()
+  const readiness = next.ready.catch(error => error)
+  const close = vi.spyOn(next.store, 'close'), restore = vi.spyOn(next.setup, 'restore')
+  const resume = vi.spyOn(next.executor, 'resume'), start = vi.spyOn(next.effects, 'start')
+  controller.resolveAgent.mockClear()
+  await entered.promise
+  const stopping = next.stop()
+  try {
+    expect(next.lifetime.aborted).toBe(true)
+    expect(next.stop()).toBe(stopping)
+    await Promise.resolve(); await Promise.resolve()
+    expect(close).not.toHaveBeenCalled()
+    expect(() => next.store.settings()).not.toThrow()
+  } finally {
+    release.resolve()
+    await readiness
+    await stopping
+  }
+  expect(close).toHaveBeenCalledOnce(); expect(restore).toHaveBeenCalledOnce()
+  expect(resume).not.toHaveBeenCalled(); expect(start).not.toHaveBeenCalled()
+  if (phase === 'setup') expect(controller.resolveAgent).not.toHaveBeenCalled()
+  expect(next.health.runtime?.state).not.toBe('ready')
+  expect(process.env.GIT_CONFIG_GLOBAL).toBe(previous.git); expect(process.env.PATH).toBe(previous.path)
+  await (await restart()).ready
+  expect(runtime.health.runtime?.state).toBe('ready')
 })

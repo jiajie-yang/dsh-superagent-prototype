@@ -3,6 +3,7 @@ import type { OutboundMessage } from '../core/index.ts'
 import type { SourceContext } from './host.ts'
 import { CliError } from '../infra/commands.ts'
 import { gitlabPages, NoteSchema, objectPath, type ObjectKind } from './gitlab-read.ts'
+const AUTOMATED_AGENT = 'This is by an automated agent, not a human.'
 export async function sendGitlab(host: Pick<SourceContext, 'commands'>, message: OutboundMessage): Promise<'sent' | 'gone'> {
   const account = host.commands.deployment.gitlab
   const address = message.channel.address
@@ -15,7 +16,8 @@ export async function sendGitlab(host: Pick<SourceContext, 'commands'>, message:
   try {
     const notes = await gitlabPages(host.commands, NoteSchema, `${path}/notes`)
     if (notes.some(note => note.author.id === account.userId && note.body.includes(marker))) return 'sent'
-    await host.commands.gitlab(discussion ? `${path}/discussions/${discussion}/notes` : `${path}/notes`, 'POST', { body: `${message.text}\n\n${marker}` })
+    const text = message.text.trimStart().startsWith(AUTOMATED_AGENT) ? message.text : `${AUTOMATED_AGENT}\n\n${message.text}`
+    await host.commands.gitlab(discussion ? `${path}/discussions/${discussion}/notes` : `${path}/notes`, 'POST', { body: `${text}\n\n${marker}` })
     return 'sent'
   } catch (error) {
     // 404 can also mean access was revoked; never drop such messages.

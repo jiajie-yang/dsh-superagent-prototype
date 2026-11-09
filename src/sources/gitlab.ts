@@ -114,7 +114,7 @@ export async function pollGitlab(ctx: SourceContext, signal?: AbortSignal): Prom
   const attempt = async (work: () => Promise<void>, id?: string) => {
     try { active(); await work(); active(); completed++ } catch (error) { failed(error, id) }
   }
-  const bound = new Set(ctx.tickets.open().flatMap(t => t.follows?.filter(f => !f.closed && f.thread.startsWith('gitlab:')).map(f => f.thread) ?? []))
+  const bound = (id: string) => ctx.tickets.open().some(t => t.follows?.some(f => !f.closed && f.thread === `gitlab:${id}`))
   const process = async (kind: ObjectKind, object: GitlabObject, projectScan = true) => {
     active()
     const id = gitlabThread(a.baseUrl, a.projectId, kind, object.iid)
@@ -126,18 +126,21 @@ export async function pollGitlab(ctx: SourceContext, signal?: AbortSignal): Prom
       if (rejected) await ctx.receive({ ...rejected, meta: { ...rejected.meta, fork: true } })
       return
     }
+    const openedMerge = kind === 'mr' && object.state === 'opened'
+    // Establish ownership before intake so the first discussion reaches its Ticket.
+    if (openedMerge) observeMerge(ctx, object)
     // Intake precedes closure. A discussion failure must not hide validated lifecycle state.
     try {
-      await receiveObject(ctx, kind, object, ctx.state.get(KV.gitlab.cursor(id)) ?? baseline, signal, projectScan)
+      await receiveObject(ctx, kind, object, ctx.state.get(KV.gitlab.cursor(id)) ?? baseline, signal, projectScan && !(openedMerge && bound(id)))
     } catch (error) {
       active()
-      if (kind === 'mr') observeMerge(ctx, object)
+      if (kind === 'mr' && !openedMerge) observeMerge(ctx, object)
       throw error
     }
     active()
     if (kind === 'mr') {
-      observeMerge(ctx, object)
-      if (bound.has(`gitlab:${id}`) && object.state === 'opened') await observeCi(ctx, object)
+      if (!openedMerge) observeMerge(ctx, object)
+      if (openedMerge && bound(id)) await observeCi(ctx, object)
     }
     ctx.state.set(KV.gitlab.cursor(id), cursorAt(started))
     ctx.threads.patch(`gitlab:${id}`, { pollError: undefined })

@@ -27,7 +27,8 @@ export function claimMerge(ctx: SourceContext, ticketId: string, mr: GitlabObjec
   if (!started && !own) return 'MR is not the originating MR or an agent MR on this ticket branch'
   if (ctx.tickets.open().some(t => t.id !== ticketId && t.follows?.some(f => f.thread === thread && !f.closed))) return 'MR belongs to another active ticket'
   if (mr.state === 'opened') {
-    ctx.tickets.bindThread(ticketId, ref, own)
+    const follow = ticket.follows?.find(f => f.thread === thread)
+    if (!follow || follow.closed || (own && !follow.own)) ctx.tickets.bindThread(ticketId, ref, own)
     ctx.threads.patch(thread, { iid: mr.iid, objectKind: 'mr', url: mr.web_url })
   }
   return undefined

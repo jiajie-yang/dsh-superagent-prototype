@@ -107,6 +107,9 @@ describe('GitLab MR and replies', () => {
     expect(claimMerge(h.ctx, 'other', mr({ source_branch: 'other' }))).toMatch(/another/)
     expect(ticketCard(h.store.tickets.get('task')!, key => h.store.threads.get(key))).toMatchObject({ mr_iid: 3, mr_url: expect.stringContaining('merge_requests/3') })
     expect(mergeOf(h.store.tickets.get('task')!)?.iid).toBe(3)
+    const bind = vi.spyOn(h.ctx.tickets, 'bindThread')
+    observeMerge(h.ctx, mr())
+    expect(bind).not.toHaveBeenCalled()
     observeMerge(h.ctx, mr({ state: 'merged', merged_at: at }))
     expect(h.store.tickets.get('task')?.follows?.[0]?.closed?.outcome).toBe('merged')
   })
@@ -114,12 +117,16 @@ describe('GitLab MR and replies', () => {
     const h = harness(), api = vi.spyOn(h.commands, 'gitlab')
     const channel = { source: 'gitlab', thread: 'gitlab:x', address: { instance: account.baseUrl, projectId: '42', objectKind: 'mr', iid: '3', discussionId: 'd1' } }
     const message = { id: 'out', channel, text: 'result', kind: 'reply' as const }
+    const signed = 'This is by an automated agent, not a human.\n\nresult'
     api.mockResolvedValueOnce([]).mockResolvedValueOnce({})
     expect(await sendGitlab(h.ctx, message)).toBe('sent')
-    expect(api.mock.calls[1]).toEqual(['merge_requests/3/discussions/d1/notes', 'POST', { body: 'result\n\n<!-- dsh-superagent:out -->' }])
+    expect(api.mock.calls[1]).toEqual(['merge_requests/3/discussions/d1/notes', 'POST', { body: `${signed}\n\n<!-- dsh-superagent:out -->` }])
     api.mockResolvedValueOnce([{ id: 1, body: '<!-- dsh-superagent:out -->', author: { id: 7, username: 'agent' }, created_at: at, updated_at: at }])
     expect(await sendGitlab(h.ctx, message)).toBe('sent')
     expect(api).toHaveBeenCalledTimes(3)
+    api.mockResolvedValueOnce([]).mockResolvedValueOnce({})
+    expect(await sendGitlab(h.ctx, { ...message, id: 'signed', text: signed })).toBe('sent')
+    expect(api.mock.calls[4]![2]).toEqual({ body: `${signed}\n\n<!-- dsh-superagent:signed -->` })
     api.mockRejectedValueOnce(new CliError('not found', 404))
     await expect(sendGitlab(h.ctx, message)).rejects.toThrow('not found')
     await expect(sendGitlab(h.ctx, { ...message, channel: { ...channel, address: { ...channel.address, projectId: '43' } } })).rejects.toThrow('outside')
@@ -371,12 +378,14 @@ describe('GitLab minimal repair regressions', () => {
     await pollGitlab(h.ctx); expect(h.receive.mock.calls.length).toBe(count)
   })
 
-  it('persists a no-pipeline baseline and delivers the first pipeline exactly once across SQLite restarts', async () => {
+  it('auto-binds an MR before its first review and persists pipeline feedback across SQLite restarts', async () => {
     const path = directory(), id = gitlabThread(account.baseUrl, 42, 'mr', 3)
     let h = harness(path), pipeline: GitlabObject['head_pipeline'] = null
     const mock = () => vi.spyOn(h.commands, 'gitlab').mockImplementation(async path => {
       if (path === 'merge_requests/3') return mr({ sha: 'head', head_pipeline: pipeline }) as never
-      if (path.includes('?state=all') || path.includes('/discussions')) return [] as never
+      if (path.startsWith('merge_requests?')) return [mr()] as never
+      if (path.includes('/discussions')) return [{ id: 'first-review', notes: [{ id: 99, body: 'Please add a regression test', author: { id: 9, username: 'alice' }, created_at: at, updated_at: at }] }] as never
+      if (path.includes('?state=all')) return [] as never
       throw new Error(path)
     })
     const reopen = () => {
@@ -384,8 +393,13 @@ describe('GitLab minimal repair regressions', () => {
       h = harness(path); mock()
     }
     mock()
-    h.store.tickets.save(ticket('task')); h.engine.bindThread('task', { source: 'gitlab', id }, true)
+    h.store.tickets.save(ticket('task')); h.store.set(KV.gitlab.baseline, at)
     await pollGitlab(h.ctx)
+    expect(h.store.tickets.get('task')?.follows).toContainEqual({ thread: `gitlab:${id}`, own: true })
+    const review = h.receive.mock.calls.map(([e]) => e).find(e => e.meta.noteId === 99)!
+    expect(review.meta.projectScan).toBe(false)
+    expect(h.store.triggers.disposition(review.id)?.filtered).toBeUndefined()
+    expect(h.store.tickets.get('task')?.inputs.filter(i => i.kind === 'trigger' && i.triggerId === review.id)).toHaveLength(1)
     expect(h.receive.mock.calls.filter(([e]) => e.meta.ci)).toHaveLength(0)
     expect(h.store.get(KV.gitlab.ci(id))).toEqual({ fingerprint: 'no-pipeline', revision: 0 })
     reopen()
@@ -404,6 +418,7 @@ describe('GitLab minimal repair regressions', () => {
     await pollGitlab(h.ctx)
     expect(h.receive.mock.calls.filter(([e]) => e.meta.ci)).toHaveLength(0)
     expect(h.store.tickets.get('task')?.inputs.filter(i => i.kind === 'trigger' && i.triggerId === events[0]!.id)).toHaveLength(1)
+    expect(h.store.tickets.get('task')?.inputs.filter(i => i.kind === 'trigger' && i.triggerId === review.id)).toHaveLength(1)
   })
 
   it('revalidates old path mandates and resumes ended work after a same-ID project rename, but rejects foreign identities', () => {

@@ -16,7 +16,7 @@ const MARKER = '# Written by dsh-superagent on every start; edits are lost.'
 /** Markers of files written under the project's earlier names (`dsh-tag`, `dsh-go`, `dsh-freelancer`), which `dsh-superagent` owns and replaces too. */
 const LEGACY_MARKERS = ['dsh-tag', 'dsh-go', 'dsh-freelancer'].map(name => `# Written by ${name} on every start; edits are lost.`)
 /** Commands workers need, which `blockedCommands` cannot block: the shims and git. */
-export const WORKER_COMMANDS: readonly string[] = ['gh', 'glab', 'git', 'lark-cli']
+export const WORKER_COMMANDS: readonly string[] = ['gh', 'git', 'lark-cli']
 export const workerBin = (stateDir: string): string => join(stateDir, 'worker-bin')
 export const workerGitConfig = (stateDir: string): string => join(stateDir, 'worker-gitconfig')
 const shellQuote = (value: string): string => `'${value.replaceAll("'", "'\\''")}'`
@@ -99,9 +99,9 @@ export async function writeEnvironment(deployment: Pick<Deployment, 'stateDir' |
   const run = (program: string): string => `${withoutShims}\nexec ${shellQuote(program)} "$@"`
   const fail = (message: string): string => `echo ${shellQuote(message)} >&2\nexit 1`
   await shim('gh', gitlab ? fail('GitHub is unavailable in this GitLab deployment.') : run(githubAccount(deployment).cli))
-  await shim('glab', gitlab ? run(gitlab.cli) : fail('GitLab is not configured.'))
+  if (gitlab) await shim('glab', run(gitlab.cli))
   await shim('lark-cli', feishu ? run(feishu.cli) : fail('lark-cli is unavailable: this installation has no Feishu bot.'))
-  for (const name of new Set(blockedCommands.filter(name => !WORKER_COMMANDS.includes(name)))) {
+  for (const name of new Set(blockedCommands.filter(name => !WORKER_COMMANDS.includes(name) && !(gitlab && name === 'glab')))) {
     await shim(name, fail(`${name} is blocked in this installation; use ${gitlab ? 'glab' : 'gh'}, which acts as ${gitlab?.username ?? githubAccount(deployment).login}.`))
   }
   for (const name of before) if (!kept.has(name)) await unlink(join(dir, name))

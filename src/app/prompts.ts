@@ -18,7 +18,7 @@ const TEAM_HEADINGS: Record<TeamSection, string> = { communication: 'Communicati
 export const SKILL_NAME = /^[a-z][a-z0-9-]*$/
 /** Prefix prepended to skill names when registering them in DSH Sessions. */
 export const SKILL_PREFIX = 'dsh-superagent-'
-const SkillNameSchema = z.string().regex(SKILL_NAME).refine(name => !(Object.keys(sourceSkills) as string[]).includes(name),
+const SkillNameSchema = z.string().regex(SKILL_NAME).refine(name => name !== 'feishu' && name !== 'github',
   'This name belongs to a built-in skill')
 /** The built-in parts a team may override, by key: both roles' parts, the Source skills, and the generated parts' templates. */
 const PART_KEYS = ['runtime/shared', 'runtime/orchestrator', 'runtime/worker', 'runtime/subscriptions', 'runtime/replies',
@@ -35,6 +35,8 @@ const OverrideSchema = z.object({ text: z.string(),
 export const PromptConfigSchema = z.object({ communication: z.string(), scope: z.string(), delivery: z.string(),
   skills: z.record(SkillNameSchema, z.string()), overrides: z.record(z.string(), OverrideSchema).optional()
     .describe('Text in place of a built-in part, by its key in prompts/defaults; a part not named follows its built-in text.') }).strict()
+const GitlabPromptConfigSchema = PromptConfigSchema.refine(config => !Object.hasOwn(config.skills, 'gitlab'),
+  { path: ['skills', 'gitlab'], message: 'This name belongs to a built-in skill' })
 export type PromptConfig = z.infer<typeof PromptConfigSchema>
 export interface PromptVersion { revision: number; previousRevision: number | null; savedAt: string; source: string; config: PromptConfig;
   /** Original unmigrated config preserved when differences cannot be compared across schema versions. */
@@ -46,13 +48,14 @@ const POLICY_HEAD = '## Policy\nPolicy version {version}; accept mode {mode}. Th
 type Role = 'orchestrator' | 'worker'
 /** A built-in part a team may override: the roles that read it, its text, and the placeholders a template's override keeps. */
 interface BuiltInPart { roles: readonly Role[]; text: string; placeholders?: readonly string[] }
+type BuiltInParts = Readonly<Record<Exclude<PartKey, 'skill/gitlab'>, BuiltInPart> & { 'skill/gitlab'?: BuiltInPart }>
 const BOTH: readonly Role[] = ['orchestrator', 'worker'], MAIN: readonly Role[] = ['orchestrator'], WORKER: readonly Role[] = ['worker']
-let parts: Readonly<Record<PartKey, BuiltInPart>> | undefined
+let parts: BuiltInParts | undefined
 /**
- * The built-in parts of both roles' prompts, the two Source skills, and the templates of the generated parts, whose data the
+ * The built-in parts of both roles' prompts, the Source skills, and the templates of the generated parts, whose data the
  * system fills in, by the key an override names them by. Built on first use, as the texts it reads are imported in a cycle.
  */
-export const builtInParts = (provider: string = 'github'): Readonly<Record<PartKey, BuiltInPart>> => {
+export const builtInParts = (provider: string = 'github'): BuiltInParts => {
   const defaults = parts ??= {
   'runtime/shared': { roles: BOTH, text: sharedPrompt }, 'runtime/orchestrator': { roles: MAIN, text: masterPrompt },
   'runtime/worker': { roles: WORKER, text: workerPrompt },
@@ -67,19 +70,21 @@ export const builtInParts = (provider: string = 'github'): Readonly<Record<PartK
   'runtime/policy/none': { roles: MAIN, text: `${POLICY_HEAD} No rule is enabled: a proactive candidate can only be ignored.`,
     placeholders: ['{version}', '{mode}'] },
   'skill/feishu': { roles: BOTH, text: `${sourceSkills.feishu}\n\n## CLI usage\n${cliNotes}` },
-  'skill/gitlab': { roles: BOTH, text: sourceSkills.gitlab },
   'skill/github': { roles: BOTH, text: `${sourceSkills.github}\n\n## CLI usage\n${cliNotes}` },
   }
-  return provider === 'gitlab' ? { ...defaults, 'runtime/worker': { roles: WORKER, text: gitlabWorkerPrompt } } : defaults
+  return provider === 'gitlab' ? { ...defaults, 'runtime/worker': { roles: WORKER, text: gitlabWorkerPrompt },
+    'skill/gitlab': { roles: BOTH, text: sourceSkills.gitlab } } : defaults
 }
 /** The key of a built-in text, which an override's `base` records. */
 export const builtInBase = (text: string): string => key('prompt-built-in', text)
 /** The built-in part a key names, if any; a name an object's prototype has names none. */
-export const builtInPart = (part: string, provider: string = 'github'): BuiltInPart | undefined =>
-  Object.hasOwn(builtInParts(provider), part) ? builtInParts(provider)[part as PartKey] : undefined
+export function builtInPart(part: string, provider: string = 'github'): BuiltInPart | undefined {
+  const available = builtInParts(provider)
+  return Object.hasOwn(available, part) ? available[part as PartKey] : undefined
+}
 /** The text of a built-in part: the team's override, else the built-in one. */
 const builtIn = (config: PromptConfig, part: PartKey, provider: string = 'github'): string =>
-  (config.overrides && Object.hasOwn(config.overrides, part) ? config.overrides[part]!.text : undefined) ?? builtInParts(provider)[part].text
+  (config.overrides && Object.hasOwn(config.overrides, part) ? config.overrides[part]!.text : undefined) ?? builtInParts(provider)[part]!.text
 /** Fill a template's placeholders in one pass, so text filled in is not read for placeholders again. */
 const fill = (template: string, values: Record<string, string>): string =>
   template.replace(/\{(\w+)\}/g, (match, name: string) => Object.hasOwn(values, name) ? values[name]! : match)
@@ -121,8 +126,10 @@ export function promptParts(config: PromptConfig, role: Role, environment?: stri
 export function composePrompt(config: PromptConfig, role: Role, environment?: string, policy?: { key: string; text: string }, provider: string = 'github'): string {
   return promptParts(config, role, environment, policy, provider).map(part => part.text).join('\n\n')
 }
-export function composeSkill(config: PromptConfig, name: string): string {
-  return name === 'feishu' || name === 'github' || name === 'gitlab' ? builtIn(config, `skill/${name}`) : config.skills[name] ?? ''
+export function composeSkill(config: PromptConfig, name: string, provider: string = 'github'): string {
+  const part = `skill/${name}`
+  const skill = builtInPart(part, provider)
+  return skill ? config.overrides?.[part]?.text ?? skill.text : config.skills[name] ?? ''
 }
 
 /** An override whose built-in text changed since its `base`, with that text when kept, or whose part this version no longer has. */
@@ -148,7 +155,9 @@ export class Prompts {
   }
   /** Returns skills to register in every Session: built-in Source skills (`feishu` only when a Feishu bot is configured) followed by team skills. */
   skills(config: PromptConfig): [string, string][] {
-    return [...this.feishu() ? ['feishu'] : [], this.provider(), ...Object.keys(config.skills)].map(name => [name, composeSkill(config, name)])
+    const provider = this.provider()
+    const names = new Set([...this.feishu() ? ['feishu'] : [], provider, ...Object.keys(config.skills)])
+    return Array.from(names, name => [name, composeSkill(config, name, provider)])
   }
   current(): PromptVersion {
     const revision = this.versions.revision()
@@ -166,7 +175,7 @@ export class Prompts {
    * the built-in text again, and so does one of a part this version no longer has, which the saved version holds.
    */
   validate(value: unknown): PromptConfig {
-    const { overrides, ...config } = PromptConfigSchema.parse(value)
+    const { overrides, ...config } = (this.provider() === 'gitlab' ? GitlabPromptConfigSchema : PromptConfigSchema).parse(value)
     const saved = this.current().config.overrides ?? {}
     const kept = Object.entries(overrides ?? {}).flatMap(([name, override]) => {
       const part = builtInPart(name, this.provider())
@@ -212,7 +221,7 @@ export class Prompts {
       if (previous.revision === 0 && !this.versions.get(0)) this.versions.keep(previous)
       // The built-in text each override was edited from, kept to show what an upgrade changed in it.
       for (const [part, { base }] of Object.entries(config.overrides ?? {})) {
-        const text = builtInParts(this.provider())[part as PartKey].text
+        const text = builtInParts(this.provider())[part as PartKey]!.text
         if (base === builtInBase(text) && this.store.get(KV.prompts.builtIn(base)) === undefined) this.store.set(KV.prompts.builtIn(base), text)
       }
       return this.versions.save(revision => ({ revision, previousRevision: previous.revision, savedAt: new Date().toISOString(), source, config }))

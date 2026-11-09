@@ -4,7 +4,6 @@ import type {} from '@deepseek-ai/dsh-host-webserver'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { z } from 'zod'
 import { THREAD_FILTERS, TICKET_FILTERS, type Api, type ApiResponse, type RouteParams } from './api.ts'
-import { sourceSkills } from './context.ts'
 import type { ModelCatalog } from '@deepseek-ai/dsh-api-session-controller/types'
 import { PromptConflict, SKILL_NAME, SKILL_PREFIX, TEAM_SECTIONS, builtInBase, builtInParts, defaultPrompts, savePrompts, type Prompts }
   from './prompts.ts'
@@ -126,7 +125,8 @@ function promptsView(runtime: HttpHost, revision: number | undefined, offset: nu
   // built-in text changed since, the text they were edited from when known.
   const parts = Object.entries(builtInParts(runtime.machine.repositoryProvider)).map(([key, part]) => ({ key, ...part, base: builtInBase(part.text) }))
   return { masterId: runtime.masterId, current: shown, defaults: defaultPrompts(runtime.machine.repositoryProvider), sections: TEAM_SECTIONS, skillName: SKILL_NAME.source,
-    builtin: Object.keys(sourceSkills), skillPrefix: SKILL_PREFIX, parts, defaultChanged: runtime.prompts.defaultChanged(shown.config),
+    builtin: parts.filter(part => part.key.startsWith('skill/')).map(part => part.key.slice('skill/'.length)),
+    skillPrefix: SKILL_PREFIX, parts, defaultChanged: runtime.prompts.defaultChanged(shown.config),
     ...runtime.sessions.status(), ...runtime.prompts.history(offset) }
 }
 export type PromptsView = ReturnType<typeof promptsView>

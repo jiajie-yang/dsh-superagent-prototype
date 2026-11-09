@@ -160,8 +160,9 @@ describe('GitLab deployment and prompt contracts', () => {
     const resolved = await resolveGitlab(testMachine({ stateDir: d }), { baseUrl: account.baseUrl, project: account.project, cli }, probe)
     expect(resolved.gitlab).toMatchObject({ projectId: 42, userId: 7 })
     expect(probe.mock.calls[0]![0]).toEqual([cli, 'api', '--hostname', account.host, 'user'])
-    await writeEnvironment(resolved, [])
+    await writeEnvironment(resolved, ['glab'])
     expect(readFileSync(workerGitConfig(resolved.stateDir), 'utf8')).toContain(`[credential "${account.baseUrl}"]`)
+    expect(readFileSync(join(resolved.stateDir, 'worker-bin', 'glab'), 'utf8')).toContain(`exec '${cli}'`)
   })
   it('rejects binding changes even with only ended tickets and preserves custom prompt text', () => {
     const h = harness()
@@ -175,6 +176,7 @@ describe('GitLab deployment and prompt contracts', () => {
     const config = prompts.current().config
     expect(prompts.compose(config, 'worker')).not.toContain('DSH_SUPERAGENT_GITHUB_ACCOUNT')
     expect(prompts.skills(config).map(([name]) => name)).toEqual(['gitlab'])
+    expect(() => prompts.validate({ ...config, skills: { gitlab: 'Custom collision' } })).toThrow('built-in skill')
     const reset = prompts.validate({ ...config, overrides: {} })
     expect(prompts.compose(reset, 'worker')).not.toContain('DSH_SUPERAGENT_GITHUB_ACCOUNT')
     expect(prompts.preview(reset).worker).toContain('Use glab')
@@ -201,6 +203,9 @@ it('boots GitLab-only with GitHub installed and routes a Feishu task through wor
     expect(h.runtime.deployment.github).toBeUndefined()
     expect(h.runtime.sources.instance('github')?.enabled).toBe(false)
     expect(h.runtime.store.get(KV.store.binding)).toMatchObject({ provider: 'gitlab', projectId: '42' })
+    const { settings, store } = h.runtime
+    await expect(settings.save('executor', { ...store.settings().executor, blockedCommands: ['glab'] },
+      store.blockRevision('executor'), 'panel')).rejects.toThrow('glab cannot be blocked')
     const { ticket: t } = await h.acceptedTicket(feishu('1', '修复按钮'))
     const current = h.runtime.store.tickets.get(t.id)!
     const merge = mr({ source_branch: `agent/${current.execution!.name}`, author: { id: 7, username: 'agent-bot' } })

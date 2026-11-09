@@ -12,6 +12,7 @@ import { Runtime } from '../../src/app/runtime.ts'
 import { Store } from '../../src/app/store.ts'
 import { SettingsSchema } from '../../src/policy.ts'
 import { feishuKind, feishuTrigger } from '../../src/sources/feishu.ts'
+import { boundGitlabKind } from '../../src/sources/gitlab.ts'
 import { githubKind } from '../../src/sources/github.ts'
 import { Commands } from '../../src/infra/commands.ts'
 import { credentialHelper, workerGitConfig } from '../../src/infra/environment.ts'
@@ -132,7 +133,7 @@ export function subagentRuntime(agents: Map<string, FakeAgent>) {
 }
 
 /** @param seed - writes to the database before the Runtime opens it, such as records an earlier version stored. */
-export async function startRuntime(seed?: (store: Store) => void) {
+export async function startRuntime(seed?: (store: Store) => void, provider: 'github' | 'gitlab' = 'github') {
   const directory = mkdtempSync(join(tmpdir(), 'orchestrator-host-'))
   const AGENT = join(directory, 'agent-gh'), BOT = join(directory, 'lark-bot')
   const repository = { default_branch: 'master', permissions: { push: true } }
@@ -245,11 +246,19 @@ export async function startRuntime(seed?: (store: Store) => void) {
   for (const [name, service] of Object.entries(services)) ctx.reflect.provide(name, service)
   for (const cli of [AGENT, BOT]) writeFileSync(cli, '#!/bin/sh\n', { mode: 0o755 })
   const seeded = new Store(join(directory, 'orchestrator.sqlite'))
-  const sources = { github: { enabled: true, config: { repository: 'acme/widgets', cli: AGENT } }, feishu: { enabled: true, config: { cli: BOT } } }
+  const sources: Record<string, { enabled: boolean; config: Record<string, unknown> }> = { github: { enabled: true, config: { repository: 'acme/widgets', cli: AGENT } }, feishu: { enabled: true, config: { cli: BOT } } }
+  if (provider === 'gitlab') {
+    delete sources.github
+    sources.gitlab = { enabled: true, config: { baseUrl: 'https://gitlab.example.com', project: 'acme/widgets', cli: AGENT } }
+    answers[`${AGENT} api --hostname gitlab.example.com user`] = JSON.stringify({ id: 7, username: 'agent-bot', email: 'bot@example.com' })
+    answers[`${AGENT} api --hostname gitlab.example.com projects/acme%2Fwidgets`] = JSON.stringify({ id: 42, path_with_namespace: 'acme/widgets', http_url_to_repo: 'https://gitlab.example.com/acme/widgets.git', permissions: { project_access: { access_level: 30 }, group_access: null } })
+    answers['git config -z --show-origin --get-all credential.https://gitlab.example.com.helper'] = `file:${workerGitConfig(directory)}\0${credentialHelper(AGENT)}\0`
+  }
   seeded.saveSettings(SettingsSchema.parse({ ...seeded.settings(), sources }))
   seed?.(seeded)
   seeded.close()
-  const runtime = new Runtime(ctx, testMachine({ stateDir: directory }), vi.fn())
+  const runtime = new Runtime(ctx, testMachine({ stateDir: directory, repositoryProvider: provider }), vi.fn())
+  if (provider === 'gitlab') runtime.sources.register(boundGitlabKind(() => runtime.configured() ? runtime.deployment.gitlab : undefined))
   await runtime.ready
   runtime.sources.register(feishuKind); runtime.sources.register(githubKind)
   const settings = runtime.store.settings()
@@ -293,7 +302,7 @@ export async function startRuntime(seed?: (store: Store) => void) {
   const step = (sessionId: string) => { steps.get(sessionId)!() }
   /** A step of the worker claims what waits for it, and is cut off before the Session took it. */
   const claim = (sessionId: string) => { claims.get(sessionId)!() }
-  return { runtime, ctx, directory, agents, tools, deliveries, relays, candidates, runTool, route, acceptedTicket, api, controller, subprocess, hooks, resolveDefault, stop,
+  return { runtime, ctx, directory, answers, agents, tools, deliveries, relays, candidates, runTool, route, acceptedTicket, api, controller, subprocess, hooks, resolveDefault, stop,
     jobs, subagents, step, claim }
 }
 export type Host = Awaited<ReturnType<typeof startRuntime>>

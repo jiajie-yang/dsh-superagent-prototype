@@ -1,3 +1,4 @@
+import { githubAccount } from '../deployment.ts'
 /** Subprocess wrapper for running gh, lark-cli, and git commands under the deployment's configured accounts. */
 import { execFile } from 'node:child_process'
 import { basename } from 'node:path'
@@ -73,7 +74,7 @@ export class Commands {
     } catch (error) { throw commandError(error, program) }
   }
   /** Runs the agent's GitHub CLI and parses its JSON output; callers should prefer `api`, which is restricted to the configured repository and validates output. */
-  async gh<T>(args: string[]): Promise<T> { return JSON.parse(await this.run(this.deployment.github.cli, args)) as T }
+  async gh<T>(args: string[]): Promise<T> { if (this.deployment.gitlab) throw new Error('GitHub is not the selected repository provider'); return JSON.parse(await this.run(githubAccount(this.deployment).cli, args)) as T }
   /**
    * Calls the GitHub API on a path within the configured repository, validating JSON output when a schema is provided
    * or returning raw CLI output (such as raw files or `--include` headers) when omitted.
@@ -82,7 +83,7 @@ export class Commands {
   async api<T>(schema: z.ZodType<T>, path: string, ...flags: string[]): Promise<T>
   async api(path: string, ...flags: string[]): Promise<string>
   async api<T>(schema: z.ZodType<T> | string, ...rest: string[]): Promise<T | string> {
-    if (typeof schema === 'string') return this.run(this.deployment.github.cli, ['api', this.path(schema), ...rest])
+    if (typeof schema === 'string') return this.run(githubAccount(this.deployment).cli, ['api', this.path(schema), ...rest])
     const [path = '', ...flags] = rest
     return schema.parse(await this.gh(['api', this.path(path), ...flags]))
   }
@@ -92,9 +93,19 @@ export class Commands {
     return validItems(item, pages.flat(), tally)
   }
   private path(path: string): string {
+    if (this.deployment.gitlab) throw new Error('GitHub is not the selected repository provider')
     const outside = /^\/|^[a-z]+:|(^|\/)\.\.?(\/|\?|$)/i.test(path)
     if (outside) throw new Error('GitHub calls are restricted to the configured repository')
     return path ? `repos/${this.repository}/${path}` : `repos/${this.repository}`
+  }
+  /** Calls only the configured GitLab instance and project; never accepts arbitrary URLs. */
+  async gitlab<T>(path: string, method = 'GET', fields?: Record<string, string>): Promise<T> {
+    const account = this.deployment.gitlab
+    if (!account) throw new Error('GitLab is not configured')
+    if (!/^[a-zA-Z0-9_/?=&%.\-]*$/.test(path) || /(^|\/)\.\.?(\/|$)/.test(path) || path.startsWith('/')) throw new Error('Invalid GitLab resource')
+    const args = ['api', '--hostname', account.host, `projects/${account.projectId}${path ? '/' + path : ''}`, '--method', method]
+    for (const [name, value] of Object.entries(fields ?? {})) args.push('--raw-field', `${name}=${value}`)
+    return JSON.parse(await this.run(account.cli, args)) as T
   }
   /**
    * Runs the Feishu bot's `lark-cli` and returns the JSON `data` payload.

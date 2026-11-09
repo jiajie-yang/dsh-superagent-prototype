@@ -43,6 +43,11 @@ export function sourceContextOf(deps: SourceContextDeps, kind: { kind: string; h
       const instance = deps.sources.instance<C>(id)
       return instance?.enabled ? instance.config : undefined
     },
+    listedBot: actorId => {
+      const part: Record<string, unknown> | undefined = deps.sources.policyPart(kind.kind)
+      const bots = part?.bots
+      return Array.isArray(bots) && bots.some(bot => bot && typeof bot === 'object' && 'id' in bot && bot.id === actorId)
+    },
     receive: trigger => deps.receive(trigger),
     atomic: work => store.atomic(work),
     state: {

@@ -8,6 +8,8 @@ import { afterEach, beforeEach, describe, expect, expectTypeOf, it, vi } from 'v
 import type { UserMessage } from '@deepseek-ai/dsh-llm'
 import { renderPrompt } from '@deepseek-ai/dsh-system-prompt'
 import { Runtime } from '../src/app/runtime.ts'
+import { Setup } from '../src/app/setup.ts'
+import { deferred } from './fixtures/async.ts'
 import { jobRegistry } from './fixtures/host.ts'
 import { evalsHealth } from '../src/app/views/overview.ts'
 import { mandateInstructions } from '../src/executor/dsh.ts'
@@ -906,6 +908,26 @@ it('lets only the panel change the execution environment, since it decides what 
   expectTypeOf(runtime.settings.pause).parameter(1).toEqualTypeOf<SettingsOrigin>()
 })
 
+it.each(['unbound state', 'legacy GitHub binding'])('keeps GitHub repository and account changes working with %s', async mode => {
+  expect(runtime.store.get(KV.store.binding)).toBeUndefined()
+  if (mode === 'legacy GitHub binding') runtime.store.set(KV.store.binding, {
+    provider: 'github', instance: 'https://github.com', projectId: 'acme/widgets', agentId: 'agent-bot',
+  })
+  const binding = runtime.store.get(KV.store.binding)
+  answers[`${OTHER()} api user`] = '{"login":"another-agent","id":8}'
+  answers[`${OTHER()} api repos/acme/another --jq {name: .full_name, push: .permissions.push}`] = '{"name":"acme/another","push":true}\n'
+  const config = { ...runtime.store.settings().sources.github!.config, repository: 'acme/another', cli: OTHER() }
+  expect(await runtime.settings.save('source:github', { enabled: true, config }, runtime.store.blockRevision('source:github'), 'panel'))
+    .toMatchObject({ saved: true, restarting: true })
+  await vi.waitFor(() => expect(restarts).toHaveBeenCalledOnce())
+  answers[HELPERS] = `file:${workerGitConfig(directory)}\0${credentialHelper(OTHER())}\0`
+  const next = await restart({}, { github: { repository: 'acme/another', cli: OTHER() } })
+  await next.ready
+  expect(next.configured()).toBe(true)
+  expect(next.deployment).toMatchObject({ repository: 'acme/another', github: { login: 'another-agent', cli: OTHER() } })
+  expect(next.store.get(KV.store.binding)).toEqual(binding)
+})
+
 it('checks a changed account CLI before saving it, restarts after the save, and lets only the panel change it', async () => {
   const save = (config: Record<string, unknown>, origin: SettingsOrigin = 'panel') => runtime.settings.save('source:github',
     { enabled: true, config: { ...runtime.store.settings().sources.github!.config, ...config } }, runtime.store.blockRevision('source:github'), origin)
@@ -974,11 +996,12 @@ it('writes worker shims and the agent environment from the configuration only, a
   const bin = join(directory, 'worker-bin')
   expect(readdirSync(bin).sort()).toEqual(['gh', 'lark-cli'])
   expect(readFileSync(join(bin, 'lark-cli'), 'utf8')).toContain(`exec '${BOT()}'`)
-  runtime.store.saveSettings({ ...runtime.store.settings(), executor: { ...runtime.store.settings().executor, blockedCommands: ['personal-gh'] } })
+  runtime.store.saveSettings({ ...runtime.store.settings(), executor: { ...runtime.store.settings().executor, blockedCommands: ['glab'] } })
   const next = await restart({}, { feishu: null })
   await next.ready
-  expect(readdirSync(bin).sort()).toEqual(['gh', 'lark-cli', 'personal-gh'])
-  expect(readFileSync(join(bin, 'personal-gh'), 'utf8')).toContain('personal-gh is blocked in this installation; use gh, which acts as agent-bot.')
+  expect(next.store.settings().executor.blockedCommands).toEqual(['glab'])
+  expect(readdirSync(bin).sort()).toEqual(['gh', 'glab', 'lark-cli'])
+  expect(readFileSync(join(bin, 'glab'), 'utf8')).toContain('glab is blocked in this installation; use gh, which acts as agent-bot.')
   expect(readFileSync(join(bin, 'lark-cli'), 'utf8')).toContain('lark-cli is unavailable: this installation has no Feishu bot.')
   expect(readFileSync(join(bin, 'gh'), 'utf8')).toContain(`exec '${AGENT()}'`)
   expect(readFileSync(workerGitConfig(directory), 'utf8')).toContain(`[credential "https://github.com"]\n\thelper = "${credentialHelper(AGENT())}"`)
@@ -1003,8 +1026,8 @@ it('waits for setup when the shim directory holds a file dsh-superagent did not 
 it('rewrites the blocked-command shims when the Executor settings change them, without a restart', async () => {
   const bin = join(directory, 'worker-bin')
   const save = (blockedCommands: string[]) => runtime.settings.save('executor', { ...runtime.store.settings().executor, blockedCommands }, runtime.store.blockRevision('executor'), 'panel')
-  expect(await save(['personal-gh'])).toMatchObject({ saved: true, restarting: false })
-  expect(readdirSync(bin).sort()).toEqual(['gh', 'lark-cli', 'personal-gh'])
+  expect(await save(['glab'])).toMatchObject({ saved: true, restarting: false })
+  expect(readdirSync(bin).sort()).toEqual(['gh', 'glab', 'lark-cli'])
   await save([])
   expect(readdirSync(bin).sort()).toEqual(['gh', 'lark-cli'])
   // The commands workers need cannot be blocked.
@@ -1793,4 +1816,66 @@ it('keeps the Policy the main Session judges by in its prompt, after admission a
   await runtime.settings.save('policy', { ...saved.policy, rules: rules.map(rule => ({ ...rule, enabled: false })) }, runtime.store.blockRevision('policy'), 'panel')
   expect(policy()).toContain('No rule is enabled: a proactive candidate can only be ignored.')
   expect(policy()).toContain('The accept mode and the rules decide proactive candidates only')
+})
+
+it('cleans up an asynchronous initialization failure and can reopen the same state directory', async () => {
+  await runtime.stop()
+  const previous = { git: process.env.GIT_CONFIG_GLOBAL, path: process.env.PATH }
+  const failure = new Error('Cannot initialize the master Session')
+  controller.resolveAgent.mockRejectedValueOnce(failure)
+  const next = await restart()
+  const close = vi.spyOn(next.store, 'close'), restore = vi.spyOn(next.setup, 'restore')
+  await expect(next.ready).rejects.toBe(failure)
+  expect(process.env.GIT_CONFIG_GLOBAL).toBe(workerGitConfig(directory))
+  const stopping = next.stop()
+  expect(next.stop()).toBe(stopping)
+  await stopping
+  expect(close).toHaveBeenCalledOnce(); expect(restore).toHaveBeenCalledOnce()
+  expect(process.env.GIT_CONFIG_GLOBAL).toBe(previous.git); expect(process.env.PATH).toBe(previous.path)
+  const recovered = await restart()
+  await recovered.ready
+  expect(recovered.health.runtime?.state).toBe('ready')
+})
+
+it.each(['setup', 'master Session'] as const)('waits for in-flight %s initialization before closing resources on unload', async phase => {
+  await runtime.stop()
+  const previous = { git: process.env.GIT_CONFIG_GLOBAL, path: process.env.PATH }
+  const entered = deferred(), release = deferred()
+  if (phase === 'setup') {
+    const run = Setup.prototype.run
+    vi.spyOn(Setup.prototype, 'run').mockImplementationOnce(async function (this: Setup, settings) {
+      entered.resolve(); await release.promise
+      return run.call(this, settings)
+    })
+  } else {
+    controller.resolveAgent.mockImplementationOnce(async (id: string) => {
+      entered.resolve(); await release.promise
+      return agents.has(id) ? { agent: agents.get(id) } : { error: { code: 'session/not-found' } }
+    })
+  }
+  const next = await restart()
+  const readiness = next.ready.catch(error => error)
+  const close = vi.spyOn(next.store, 'close'), restore = vi.spyOn(next.setup, 'restore')
+  const resume = vi.spyOn(next.executor, 'resume'), start = vi.spyOn(next.effects, 'start')
+  controller.resolveAgent.mockClear()
+  await entered.promise
+  const stopping = next.stop()
+  try {
+    expect(next.lifetime.aborted).toBe(true)
+    expect(next.stop()).toBe(stopping)
+    await Promise.resolve(); await Promise.resolve()
+    expect(close).not.toHaveBeenCalled()
+    expect(() => next.store.settings()).not.toThrow()
+  } finally {
+    release.resolve()
+    await readiness
+    await stopping
+  }
+  expect(close).toHaveBeenCalledOnce(); expect(restore).toHaveBeenCalledOnce()
+  expect(resume).not.toHaveBeenCalled(); expect(start).not.toHaveBeenCalled()
+  if (phase === 'setup') expect(controller.resolveAgent).not.toHaveBeenCalled()
+  expect(next.health.runtime?.state).not.toBe('ready')
+  expect(process.env.GIT_CONFIG_GLOBAL).toBe(previous.git); expect(process.env.PATH).toBe(previous.path)
+  await (await restart()).ready
+  expect(runtime.health.runtime?.state).toBe('ready')
 })

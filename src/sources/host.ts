@@ -36,6 +36,8 @@ export interface SourceContext {
   configured(): boolean
   /** Setup problem keeping this Source's account from running; only the Feishu bot check reports one. */
   readonly problem?: SetupProblem | undefined
+  /** Whether this source explicitly lists an actor as an automated sender. */
+  listedBot?(actorId: string): boolean
   /** Returns a Source's configuration while enabled, or undefined while disabled or uninstalled. */
   config<C extends Record<string, unknown>>(kind: string): C | undefined
   /** Ingests a trigger into the Engine and schedules the next evaluation pass; callers should await completion before advancing read cursors. */

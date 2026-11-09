@@ -2,6 +2,8 @@
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import { UserError, key, latestReport, reached, runningAssignment, threadKey, type Ticket, type Trigger } from '../core/index.ts'
 import { batchOf, inputMessage, triggerMessage, workerSessionId } from '../executor/dsh.ts'
+import { readGitlab, resourcePath } from '../sources/gitlab-read.ts'
+import { gitlabThread } from '../sources/gitlab-merge.ts'
 import { readGithub } from '../sources/github-read.ts'
 import { feishuReferences, feishuRead } from '../sources/feishu-read.ts'
 import { feishuRef } from '../sources/feishu.ts'
@@ -51,6 +53,7 @@ export const RESOURCES: readonly { name: string; holds: string; executor?: true 
   { name: 'models', holds: 'model providers, the DSH default and each role\'s model' },
   { name: 'models/<provider>', holds: 'one provider\'s models' },
   { name: 'feishu/<trigger-id>/…', holds: 'a Feishu original, as the dsh-superagent-feishu skill describes', executor: true },
+  { name: 'gitlab/issue/<iid> or gitlab/mr/<iid>[/discussions|/diffs|/pipelines]', holds: 'a GitLab object or page set bound to this ticket', executor: true },
   { name: 'github/…', holds: 'a GitHub original, as the dsh-superagent-github skill describes', executor: true },
 ]
 export const resourceGrammar = (executor: boolean): string => RESOURCES.filter(resource => !executor || resource.executor)
@@ -118,7 +121,7 @@ async function transcript(host: ResourceHost, ticketId: string) {
 const ROUTES: readonly Route[] = [
   ['tickets', read => {
     const host = main(read), tickets = host.store.tickets.list()
-    const card = (ticket: Ticket) => ({ ...ticketCard(ticket), ...host.sessions.modelRetry(runningAssignment(ticket) && workerSessionId(ticket.id)) })
+    const card = (ticket: Ticket) => ({ ...ticketCard(ticket, key => host.store.threads.get(key)), ...host.sessions.modelRetry(runningAssignment(ticket) && workerSessionId(ticket.id)) })
     return list(read, (offset, count) => tickets.slice(offset, offset + count).map(card))
   }],
   ['triggers', read => {
@@ -177,8 +180,8 @@ const ROUTES: readonly Route[] = [
     const { host, resource, rest, sessionId, ticketId } = read
     const prompts = host.prompts
     const bound = host.promptVersion(sessionId)
-    const parts = () => Object.fromEntries(Object.entries(builtInParts()).map(([key, part]) => [key, part.text]))
-    const version = rest === 'current' ? bound : rest === 'defaults' && !ticketId ? { revision: 0, config: defaultPrompts(), parts: parts() }
+    const parts = () => Object.fromEntries(Object.entries(builtInParts(host.commands.deployment.repositoryProvider)).map(([key, part]) => [key, part.text]))
+    const version = rest === 'current' ? bound : rest === 'defaults' && !ticketId ? { revision: 0, config: defaultPrompts(host.commands.deployment.repositoryProvider), parts: parts() }
       : /^\d+$/.test(rest) ? (Number(rest) === 0 && prompts.current().revision === 0 ? prompts.current() : prompts.version(Number(rest))) : undefined
     if (!version || (ticketId && !host.mayRead(sessionId, version.revision))) throw new Error('Unknown or inaccessible prompt version')
     return text({ ...read, resource: rest === 'current' ? `prompts/${version.revision}` : resource }, JSON.stringify(version))
@@ -206,6 +209,18 @@ const ROUTES: readonly Route[] = [
     const commands = read.host.commands.withSignal(read.signal)
     return sourcePage(read, 'feishu', () => feishuRead(commands, ref, read.resource, read.host.feishuPageSize()))
   }],
+  ['gitlab/', read => {
+    const a = read.host.commands.deployment.gitlab
+    if (!a) throw new Error('GitLab is not configured')
+    const path = resourcePath(read.resource), [kind, number] = path.split('/')
+    const thread = `gitlab:${gitlabThread(a.baseUrl, a.projectId, kind === 'issues' ? 'issue' : 'mr', Number(number))}`
+    if (read.ticketId) {
+      const ticket = read.host.store.tickets.get(read.ticketId)
+      const source = ticket && read.host.store.triggers.get(ticket.origin.triggerId)
+      if (!ticket || !(read.host.store.threads.get(thread)?.subscriptions.includes(ticket.id) || ticket.follows?.some(f => f.thread === thread) || source?.threads.some(t => `gitlab:${t.id}` === thread))) throw new Error('GitLab resource does not belong to this ticket')
+    }
+    return sourcePage(read, 'GitLab', () => readGitlab(read.host.commands.withSignal(read.signal), read.resource))
+  }],
   ['github/', read => sourcePage(read, 'github', () => readGithub(read.host.commands.withSignal(read.signal), read.resource))],
   ['trigger/', async read => {
     const { host, rest, ticketId, offset, signal } = read
@@ -225,7 +240,7 @@ const ROUTES: readonly Route[] = [
     const neighbours = host.store.read.neighbours(threadKey(found.threads[0]!), found.at, found.id)
     const around = { before: shown(neighbours.before), after: shown(neighbours.after) }
     return { ...card, ...await host.sourceLink(found, signal), acknowledgement: host.store.replyStatus(key('ack', found.id)) ?? 'not_requested',
-      ...(ref ? { context: feishuReferences(ref) } : {}),
+      ...(ref ? { context: feishuReferences(ref) } : found.source === 'gitlab' ? { context: { skill: 'dsh-superagent-gitlab', message: `gitlab/${found.meta.objectKind}/${found.meta.iid}`, thread: `gitlab/${found.meta.objectKind}/${found.meta.iid}/discussions` } } : {}),
       ...(offset === 0 ? {
         ...repliedTo ? { replied_to: triggerLine(repliedTo) } : {},
         around: { ...around.before ? { before: triggerLine(around.before) } : {}, ...around.after ? { after: triggerLine(around.after) } : {} },
@@ -249,7 +264,7 @@ const ROUTES: readonly Route[] = [
         ({ thread: key, ...context ? { context: true } : {}, ...bound.has(key) ? { bound: true } : {} })
       const threads = [...subscribed.map(thread => marked(thread.key, !!thread.context?.includes(id))),
         ...[...bound].filter(key => !subscribed.some(thread => thread.key === key)).map(key => marked(key, false))]
-      return { ...ticketDetails(ticket, threads, batchOf(host, ticket), !!ticketId), ...retry }
+      return { ...ticketDetails(ticket, threads, batchOf(host, ticket), !!ticketId, key => host.store.threads.get(key)), ...retry }
     }
     if (section === 'assignments' || section === 'inputs') {
       if (part !== undefined) throw new Error('Unknown context resource')

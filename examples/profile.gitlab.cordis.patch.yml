@@ -1,0 +1,20 @@
+# GitLab-only profile ($DSH_HOME/profiles/<profile>/cordis.patch.yml).
+# Create a NEW profile from the web template once, install this bundle, then copy this file.
+# Replace the stateDir placeholder with a new absolute path; choose an unused loopback port.
+# Set the HTTPS instance, project and dedicated glab wrapper in the Superagent Source panel, not here.
+# See docs/006-deployment.md#gitlab-repository-provider for accounts, allowed users and execution setup.
+- id: webserver
+  config:
+    host: 127.0.0.1
+    port: 3084
+- id: dsh-superagent
+  config:
+    stateDir: <absolute-path-to-new-state-directory>
+    repositoryProvider: gitlab
+- id: dsh-superagent-gitlab
+  disabled: false
+- id: dsh-superagent-github
+  disabled: true
+# Optional: enable this later and configure its bot CLI on the Feishu Source.
+- id: dsh-superagent-feishu
+  disabled: true

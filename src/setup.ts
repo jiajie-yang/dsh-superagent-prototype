@@ -1,8 +1,10 @@
 /** Structured startup and configuration errors with the settings location where the operator can fix them. */
 import { fill } from './infra/text.ts'
 
-export type SetupPlace = 'deployment' | 'github' | 'feishu'
+export type SetupPlace = 'deployment' | 'github' | 'gitlab' | 'feishu'
 export const SETUP_PROBLEMS = {
+  gitlabSetupFailed: ['gitlab', 'GitLab setup failed. Verify the HTTPS instance, project, dedicated glab wrapper, agent email and Developer access.'],
+  repositoryBinding: ['deployment', 'This state directory belongs to a different repository or agent; use a new state directory.'],
   foreignFile: ['deployment', '{file} was not written by dsh-superagent; move it, or choose another state directory.'],
   gitTooOld: ['deployment', 'git does not read the github.com credential configuration dsh-superagent writes; dsh-superagent needs git 2.32 or later.'],
   environmentFailed: ['deployment', 'Preparing the agent environment failed.'],

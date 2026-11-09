@@ -27,7 +27,7 @@ it('saves team sections and skills as versions that survive a restart, with hist
   try {
     let prompts = promptsOf(store)
     expect(prompts.current().config).toEqual(defaultPrompts())
-    const config = { ...defaultPrompts(), scope: 'Finish what was asked.', delivery: '', skills: { release: 'Tag releases on Fridays.' } }
+    const config = { ...defaultPrompts(), scope: 'Finish what was asked.', delivery: '', skills: { gitlab: 'Internal GitLab workflow.' } }
     prompts.save(config, 0, 'panel')
     expect(composePrompt(prompts.current().config, 'worker')).toContain('## Ticket scope\nFinish what was asked.')
     // An empty team section leaves the prompt; the fixed sections stay.
@@ -35,11 +35,12 @@ it('saves team sections and skills as versions that survive a restart, with hist
     expect(store.get('settings-revision')).toBeUndefined()
     store.close(); store = new Store(join(dir, 'db')); prompts = promptsOf(store)
     expect(prompts.current()).toMatchObject({ revision: 1, config })
+    expect(prompts.skills(prompts.current().config)).toContainEqual(['gitlab', config.skills.gitlab])
     prompts.save(prompts.version(0).config, 1, 'tool')
     expect(prompts.current()).toMatchObject({ revision: 2, previousRevision: 1, config: defaultPrompts() })
     expect(prompts.history(0, 1)).toMatchObject({ revisions: [{ revision: 2 }], next_offset: 1 })
     expect(prompts.history(2, 1).next_offset).toBeNull()
-    expect(prompts.history(1, 1).revisions[0]).toMatchObject({ revision: 1, changed: ['scope', 'delivery', 'skill/release'] })
+    expect(prompts.history(1, 1).revisions[0]).toMatchObject({ revision: 1, changed: ['scope', 'delivery', 'skill/gitlab'] })
     expect(() => prompts.save(config, 1, 'panel')).toThrow('version changed')
   } finally { store.close(); rmSync(dir, { recursive: true, force: true }) }
 })

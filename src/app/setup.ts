@@ -1,5 +1,8 @@
 /** Probes repository and account CLIs, configures the worker execution environment and command shims, and tracks setup readiness. */
 import type { Context } from '@deepseek-ai/cordis'
+import { resolveGitlab } from '../gitlab-deployment.ts'
+import { KV } from '../kv.ts'
+import type { Store } from './store.ts'
 import { UserError } from '../core/index.ts'
 import { SETUP_FIELDS, resolveDeployment, resolveFeishuBot, workerProbe, type Deployment, type Machine } from '../deployment.ts'
 import { agentVariables, applyEnvironment, verifyEnvironment, withoutDirectory, workerBin, writeEnvironment } from '../infra/environment.ts'
@@ -7,6 +10,8 @@ import type { Settings, SettingsBlock } from '../policy.ts'
 import { SetupError, type SetupProblem } from '../setup.ts'
 
 export interface SetupHost {
+  readonly sourceInstalled?: (id: string) => boolean
+  readonly store?: Store
   readonly context: Context
   readonly machine: Machine
   readonly lifetime: AbortSignal
@@ -61,8 +66,8 @@ export class Setup {
   async checkAccounts(block: SettingsBlock, settings: Settings): Promise<void> {
     const { machine } = this.host
     const check = block === 'source:feishu' ? resolveFeishuBot(machine, settings.sources.feishu?.config, this.probe())
-      : resolveDeployment(machine, settings.sources.github?.config, this.probe())
-    await check.catch((error: unknown) => { if (!(error instanceof SetupError) || error.place === block.slice(7)) throw error })
+      : this.repository(settings)
+    await check.catch((error: unknown) => { if (!(error instanceof SetupError) || error.code === 'repositoryBinding' || error.place === block.slice(7)) throw error })
   }
   async blockCommands(blocked: readonly string[]): Promise<void> {
     if (this.resolved) await writeEnvironment(this.resolved, blocked)
@@ -73,10 +78,33 @@ export class Setup {
     const { context, machine, lifetime } = this.host
     return workerProbe(context.subprocess, machine.stateDir, machine.stateDir, lifetime)
   }
+  private async repository(settings: Settings): Promise<Deployment> {
+    const { machine } = this.host
+    const resolved = machine.repositoryProvider === 'gitlab'
+      ? await resolveGitlab(machine, settings.sources.gitlab?.config, this.probe())
+      : await resolveDeployment(machine, settings.sources.github?.config, this.probe())
+    this.bind(resolved, false)
+    return resolved
+  }
+  private bind(deployment: Deployment, write = true): void {
+    const store = this.host.store
+    if (!store) return
+    const gl = deployment.gitlab
+    const existing = store.get(KV.store.binding)
+    // Preserve GitHub's account/repository configuration flow, but never reinterpret GitLab state as GitHub.
+    if (!gl) {
+      if (existing?.provider === 'gitlab') throw new SetupError('repositoryBinding')
+      return
+    }
+    const binding = { provider: 'gitlab', instance: gl.baseUrl, projectId: String(gl.projectId), agentId: String(gl.userId) }
+    const legacy = !existing && (store.tickets.list().length || store.db.prepare('SELECT 1 FROM trigger LIMIT 1').get() || store.keys(KV.sessions.prompts).length)
+    if (legacy || (existing && JSON.stringify(existing) !== JSON.stringify(binding))) throw new SetupError('repositoryBinding')
+    if (write && !existing) store.set(KV.store.binding, binding)
+  }
   private async resolve(settings: Settings): Promise<Deployment> {
     const { context, machine, lifetime } = this.host
     const probe = this.probe()
-    const deployment = await resolveDeployment(machine, settings.sources.github?.config, probe)
+    const deployment = await this.repository(settings)
     const feishu = await resolveFeishuBot(machine, settings.sources.feishu?.config, probe).catch((error: unknown) => {
       if (!(error instanceof SetupError)) throw error
       this.feishuProblem = error.problem
@@ -88,12 +116,15 @@ export class Setup {
       if (error instanceof SetupError) throw error
       throw new SetupError('environmentFailed', { output: error instanceof Error ? error.message : String(error) })
     }
+    if (resolved.gitlab && this.host.sourceInstalled && !this.host.sourceInstalled('gitlab')) throw new SetupError('gitlabSetupFailed')
+    if (resolved.gitlab && !this.host.store?.get(KV.store.binding) && settings.sources.gitlab?.enabled === false) throw new SetupError('gitlabSetupFailed')
     await writeEnvironment(resolved, settings.executor.blockedCommands).catch(machineProblem)
     this.restoreEnvironment = applyEnvironment(this.variables, machine.stateDir, this.path)
     await verifyEnvironment(resolved, context.subprocess, lifetime).catch((error: unknown) => {
       this.restore()
       machineProblem(error)
     })
+    this.bind(resolved)
     return resolved
   }
 }

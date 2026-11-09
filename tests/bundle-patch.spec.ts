@@ -4,10 +4,11 @@ import { createRequire } from 'node:module'
 import { join } from 'node:path'
 import { expect, it } from 'vitest'
 import { ROUTER_PRESET, WORKER_PRESET } from '../src/app/sessions.ts'
+import { Config, machineOf } from '../src/deployment.ts'
 
 interface Row { id?: string; name: string; disabled?: unknown; config?: Record<string, unknown> & { plugins?: Row[] } | Row[] }
 /** The patch as DSH reads it: Cordis's include plugin parses `!!js` scalars, and applies the inserts to an entry list. */
-async function patched(): Promise<Row[]> {
+async function patched(profile?: string): Promise<Row[]> {
   const cordis = createRequire(createRequire(import.meta.url).resolve('@deepseek-ai/cordis/package.json'))
   const include = cordis.resolve('@deepseek-ai/cordis-plugin-include')
   const { entryListSchema, applyEntryPatches } = await import(include) as {
@@ -15,7 +16,13 @@ async function patched(): Promise<Row[]> {
   const yaml = await import(createRequire(include).resolve('js-yaml')) as { load(text: string, options: { schema: unknown }): unknown }
   const patches = yaml.load(readFileSync(join(import.meta.dirname, '..', 'cordis.patch.yml'), 'utf8'), { schema: entryListSchema }) as unknown[]
   const warnings: string[] = []
-  const rows = applyEntryPatches([], patches, message => { warnings.push(message) })
+  let rows = applyEntryPatches([], patches, message => { warnings.push(message) })
+  if (profile) {
+    const text = readFileSync(join(import.meta.dirname, '..', profile), 'utf8')
+      .replace('<absolute-path-to-new-state-directory>', '/srv/gitlab-agent')
+    const overlay = yaml.load(text, { schema: entryListSchema }) as unknown[]
+    rows = applyEntryPatches([{ id: 'webserver', name: 'webserver' }, ...rows], overlay, message => { warnings.push(message) })
+  }
   expect(warnings).toEqual([])
   return rows
 }
@@ -26,9 +33,23 @@ const flat = (rows: readonly Row[]): Row[] => rows.flatMap(row => [row, ...Array
 const presetOf = (rows: readonly Row[], id: string) => rows.map(row => row.config as { id?: string; order?: number; plugins: Row[] })
   .find(config => config?.id === id)!
 
+it('applies the GitLab-only deployment template over the bundle without dropping its Session presets', async () => {
+  const rows = await patched('examples/profile.gitlab.cordis.patch.yml')
+  const entry = (id: string) => rows.find(row => row.id === id)!
+  expect(entry('webserver').config).toEqual({ host: '127.0.0.1', port: 3084 })
+  expect(machineOf(Config(entry('dsh-superagent').config as never))).toMatchObject({
+    stateDir: '/srv/gitlab-agent', repositoryProvider: 'gitlab',
+  })
+  expect(entry('dsh-superagent-gitlab').disabled).toBe(false)
+  expect(entry('dsh-superagent-github').disabled).toBe(true)
+  expect(entry('dsh-superagent-feishu').disabled).toBe(true)
+  expect(presetOf(rows, ROUTER_PRESET).plugins.length).toBeGreaterThan(0)
+  expect(presetOf(rows, WORKER_PRESET).plugins.length).toBeGreaterThan(0)
+})
+
 it('defines the worker preset Executor Sessions run under, with a shell that moves long commands to the background', async () => {
   const rows = await patched()
-  expect(rows.map(row => row.id)).toEqual(['dsh-superagent', 'dsh-superagent-github', 'dsh-superagent-feishu', 'dsh-superagent-worker-preset',
+  expect(rows.map(row => row.id)).toEqual(['dsh-superagent', 'dsh-superagent-github', 'dsh-superagent-gitlab', 'dsh-superagent-feishu', 'dsh-superagent-worker-preset',
     'dsh-superagent-router-preset'])
   const preset = presetOf(rows, WORKER_PRESET)
   expect(preset.id).toBe(WORKER_PRESET)

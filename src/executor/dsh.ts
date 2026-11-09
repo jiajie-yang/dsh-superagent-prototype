@@ -120,6 +120,7 @@ const capped = (text: string, limit: number, read: string) =>
  */
 export function triggerMessage(trigger: Trigger, link: { source_url?: string; source_url_read?: string }, note?: string, repliesTo?: Trigger) {
   return { trigger_id: trigger.id, from: trigger.actor.id, thread: threadKey(trigger.threads[0]!), at: trigger.at,
+    ...(trigger.source === 'gitlab' ? { context: { message: `gitlab/${trigger.meta.objectKind}/${trigger.meta.iid}`, thread: `gitlab/${trigger.meta.objectKind}/${trigger.meta.iid}/discussions` } } : {}),
     ...capped(trigger.text, TRIGGER_CHARS, `trigger/${trigger.id}`), ...link, ...(note ? { routing_note: note } : {}),
     ...(repliesTo ? { replies_to: { trigger_id: repliesTo.id, preview: repliesTo.text.replace(/\s+/g, ' ').slice(0, 160) } } : {}) }
 }

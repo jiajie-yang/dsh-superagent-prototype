@@ -4,6 +4,7 @@ import { z } from 'zod'
 import { UserError, type EngineForSettings } from '../core/index.ts'
 import { EvalConfigSchema, ExecutorConfigSchema, PolicyConfigSchema, SettingsSchema, policyEffects, policyVersion } from '../policy.ts'
 import type { Settings as SettingsValue, SettingsBlock, SettingsOrigin, SettingsSave } from '../policy.ts'
+import type { Machine } from '../deployment.ts'
 import type { SourceHost } from '../sources/host.ts'
 import type { HealthBoard, HealthEntry } from '../infra/health.ts'
 import type { SourceRegistry } from '../sources/registry.ts'
@@ -22,10 +23,12 @@ export class SettingsConflict extends Error {}
 const now = (): string => new Date().toISOString()
 /** Executor settings that control shell execution paths, prepare commands, and command shims. */
 const environment = ({ executor }: SettingsValue) => JSON.stringify([executor.directory, executor.prepare, executor.blockedCommands])
+const GitlabExecutorConfigSchema = ExecutorConfigSchema.refine(executor => !executor.blockedCommands.includes('glab'),
+  { path: ['blockedCommands'], message: 'glab cannot be blocked in a GitLab deployment' })
 
 /** Schema parser, settings merger, and non-panel origin guard for one settings block kind. */
 interface Block {
-  parse(value: unknown, sources: SourceRegistry, id: string): unknown
+  parse(value: unknown, sources: SourceRegistry, id: string, provider: Machine['repositoryProvider']): unknown
   merge(settings: SettingsValue, value: unknown, id: string): SettingsValue
   guard?(current: SettingsValue, candidate: SettingsValue, origin: SettingsOrigin): void
 }
@@ -39,7 +42,7 @@ const BLOCKS: Record<'policy' | 'eval' | 'executor' | 'source', Block> = {
   },
   eval: { parse: value => EvalConfigSchema.parse(value), merge: (settings, value) => ({ ...settings, eval: value as SettingsValue['eval'] }) },
   executor: {
-    parse: value => ExecutorConfigSchema.parse(value),
+    parse: (value, _sources, _id, provider) => (provider === 'gitlab' ? GitlabExecutorConfigSchema : ExecutorConfigSchema).parse(value),
     merge: (settings, value) => ({ ...settings, executor: value as SettingsValue['executor'] }),
     // Only the management panel may modify shell execution paths or commands.
     guard: (current, candidate, origin) => { if (origin !== 'panel' && environment(current) !== environment(candidate)) throw new UserError('panelOnlyEnvironment') },
@@ -54,6 +57,7 @@ const BLOCKS: Record<'policy' | 'eval' | 'executor' | 'source', Block> = {
 
 /** Host dependencies used by `Settings`. */
 export interface SettingsHost {
+  readonly repositoryProvider: Machine['repositoryProvider']
   readonly store: Pick<Store, 'settings' | 'saveSettings' | 'blockRevision' | 'atomic' | 'tickets' | 'get'>
   readonly sources: SourceRegistry
   /** Notified when a settings save changes the policy version. */
@@ -154,7 +158,7 @@ export class Settings {
     if (!(kind in BLOCKS)) throw new UserError('unknownBlock', { block })
     const rules = BLOCKS[kind as keyof typeof BLOCKS]
     if (kind === 'source' && !sources.kind(id)) throw new UserError('sourceNotInstalled', { source: id })
-    const parsed = rules.parse(value, sources, id)
+    const parsed = rules.parse(value, sources, id, this.host.repositoryProvider)
     const current = store.settings()
     const candidate = rules.merge(current, parsed, id)
     const model = block === 'eval' ? candidate.eval.model : block === 'executor' ? candidate.executor.model : null

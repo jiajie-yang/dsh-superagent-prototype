@@ -725,6 +725,10 @@ const TEXT = {
   'userError.noLabels': ['这个来源没有可以刷新的名称。', USER_ERRORS.noLabels[1]],
   'userError.nothingToSync': ['{source} 来源上的策略没有指定从哪里同步，或者这个来源已关闭或在等待部署检查。', USER_ERRORS.nothingToSync[1]],
   // Setup problems and health codes; English reuses the host's own text read by the log and main Session
+  'problemSetupFix.gitlab': ['检查 GitLab 来源的实例、项目和专用 glab。', 'Check the GitLab instance, project and dedicated glab.'],
+  'promptPart.skill/gitlab': ['GitLab 技能', 'GitLab skill'],
+  'setup.gitlabSetupFailed': ['GitLab 部署检查失败；检查 HTTPS 实例、项目、专用 glab、账号邮箱与 Developer 权限。', SETUP_PROBLEMS.gitlabSetupFailed[1]],
+  'setup.repositoryBinding': ['此状态目录已绑定其他仓库或账号，请使用新的状态目录。', SETUP_PROBLEMS.repositoryBinding[1]],
   'setup.repositoryUnset': ['GitHub 来源没有设置监听的仓库。', SETUP_PROBLEMS.repositoryUnset[1]],
   'setup.foreignFile': ['{file} 不是 dsh-superagent 写入的文件；移走它，或换一个状态目录。', SETUP_PROBLEMS.foreignFile[1]],
   'setup.gitTooOld': ['git 没有读取 dsh-superagent 为 github.com 写的凭据配置；需要 git 2.32 或更新版本。', SETUP_PROBLEMS.gitTooOld[1]],

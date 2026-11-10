@@ -1,12 +1,12 @@
 /** Validated project-scoped GitLab resources and explicit pagination. */
 import { z } from 'zod'
-import type { Commands } from '../infra/commands.ts'
+import { CliError, type Commands } from '../infra/commands.ts'
 import type { ThreadContext } from './kind.ts'
 
 export const UserSchema = z.object({ id: z.number().int().positive(), username: z.string(), bot: z.boolean().optional() })
 export const ObjectSchema = z.object({ iid: z.number().int().positive(), id: z.number(), title: z.string(), description: z.string().nullish(),
   author: UserSchema, created_at: z.string(), updated_at: z.string(), web_url: z.string().url(), state: z.string(),
-  source_project_id: z.number().optional(), target_project_id: z.number().optional(), source_branch: z.string().optional(),
+  project_id: z.number().optional(), source_project_id: z.number().optional(), target_project_id: z.number().optional(), source_branch: z.string().optional(),
   sha: z.string().nullish(), merged_at: z.string().nullish(), closed_at: z.string().nullish(),
   head_pipeline: z.object({ id: z.number(), sha: z.string(), status: z.string(), updated_at: z.string().optional() }).nullish() })
 export type GitlabObject = z.infer<typeof ObjectSchema>
@@ -23,7 +23,22 @@ export function objectPath(kind: ObjectKind, iid: number): string {
   if (!Number.isSafeInteger(iid) || iid <= 0) throw new Error('Invalid GitLab IID')
   return `${collection(kind)}/${iid}`
 }
-export async function gitlabPages<T>(commands: Commands, schema: z.ZodType<T>, path: string, invalid?: (error: unknown) => void): Promise<T[]> {
+export type GitlabReads = Pick<Commands, 'gitlab'>
+const coolingUntil = new WeakMap<Commands, number>()
+export const gitlabCoolingDown = (commands: Commands): boolean => (coolingUntil.get(commands) ?? 0) > Date.now()
+/** Share the project's cooldown across webhook consumption and reconciliation, including paginated reads. */
+export function gitlabEventReads(commands: Commands, signal?: AbortSignal): GitlabReads {
+  const scoped = commands.withSignal(signal)
+  return { async gitlab<T>(path: string): Promise<T> {
+    if (gitlabCoolingDown(commands)) throw new CliError('GitLab event reads are cooling down', 429)
+    try { return await scoped.gitlab<T>(path) }
+    catch (error) {
+      if (error instanceof CliError && error.code === 429) coolingUntil.set(commands, Date.now() + 30_000)
+      throw error
+    }
+  } }
+}
+export async function gitlabPages<T>(commands: GitlabReads, schema: z.ZodType<T>, path: string, invalid?: (error: unknown) => void): Promise<T[]> {
   const items: T[] = []
   for (let page = 1; page <= 10000; page++) {
     const batch = z.array(z.unknown()).parse(await commands.gitlab(`${path}${path.includes('?') ? '&' : '?'}per_page=100&page=${page}`))
@@ -37,7 +52,7 @@ export async function gitlabPages<T>(commands: Commands, schema: z.ZodType<T>, p
   }
   throw new Error('GitLab pagination exceeded its bound; cursor not advanced')
 }
-export const readMerge = async (commands: Commands, iid: number): Promise<GitlabObject> => ObjectSchema.parse(await commands.gitlab(objectPath('mr', iid)))
+export const readMerge = async (commands: GitlabReads, iid: number): Promise<GitlabObject> => ObjectSchema.parse(await commands.gitlab(objectPath('mr', iid)))
 export function resourcePath(resource: string): string {
   const match = /^gitlab\/(issue|mr)\/([1-9]\d*)(?:\/(discussions|diffs|pipelines))?$/.exec(resource)
   if (!match || (match[1] === 'issue' && match[3] && match[3] !== 'discussions')) throw new Error('Invalid GitLab resource')

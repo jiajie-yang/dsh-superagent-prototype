@@ -448,7 +448,20 @@ Output: `https%3A%2F%2Fgitlab.example.com:123`. Paste this entire string into th
 
 Leave **candidate bots** empty unless messages from another bot should become inferred candidates. That list uses the same ID format and does not let bots make explicit requests. It is not where the agent's own account or human operators belong.
 
-### 6. Verify, then run in the background
+### 6. Enable project webhooks (optional)
+
+For projects with many Issues and MRs, enable **Webhook intake** in the GitLab Source settings after configuring the receiver. Polling remains the default for existing deployments.
+
+1. Generate a dedicated shared secret, for example with `openssl rand -hex 32`. Store it in `<stateDir>/gitlab-webhook-token`, owned by the DSH user with mode `0600`. Enter the same value in GitLab's **Secret token** field. This receiver uses `X-Gitlab-Token` over HTTPS. Keep the token out of logs and source control.
+2. Use an internal HTTPS reverse proxy that GitLab can reach. Forward only `POST /webhooks/gitlab` to the existing DSH loopback listener. Preserve the request path and GitLab headers. Limit the request body to 256 KiB. Keep the management panel and other DSH paths off this proxy. For self-managed GitLab, allowlist the receiver in GitLab's outbound settings if the instance blocks access to its address.
+3. In the project, open **Settings → Webhooks** and add the receiver URL. Select **Issues**, **Merge request events**, and **Comments** and keep SSL verification enabled. Enable **Webhook intake** in Superagent and test the connection. This version processes Issue, MR and Issue/MR comment hooks. Pipeline and job hooks can remain unchecked.
+4. Create a new Issue or review comment from an allowed account and check that it arrives once. Resend the same delivery from **Recent events** to verify deduplication. Edit a comment with a mention and check that the edit appears only as context.
+
+Successful delivery means the event was durably accepted. Background processing can still be delayed by API errors. The Webhook effect health entry shows backlog and failures, and GitLab's **Recent events** shows HTTP delivery outcomes. After a `429` the webhook consumer and reconciliation share a 30-second cooldown. A failed effect remains queued with exponential backoff.
+
+In Webhook mode the Source reconciles only threads with live tickets, at intervals of at least 15 minutes. Resend failed deliveries from GitLab to recover requests for Issues and MRs that have no ticket yet. If the receiver was unavailable beyond GitLab's delivery history, the requester can send a new comment. To switch back to polling, disable the project hook and allow the webhook queue to drain before changing the Source mode. Configure a single hook for this receiver per project.
+
+### 7. Verify, then run in the background
 
 ```sh
 curl --fail --silent --show-error -H 'x-orchestrator-request: 1' \
@@ -483,4 +496,4 @@ For upgrades, wait for idle, stop gracefully and back up the state directory, re
 | State directory binding fails | Use a new directory for another instance, project or agent identity |
 | Management API disappears after unexpected initialization failure | The failed Runtime withdraws its service and cleans resources; fix the cause and restart the main plugin through DSH's Plugin Manager or restart the profile |
 
-One state directory serves one HTTPS instance and one project, including nested groups. Configuring your fork as that project is supported; cross-project fork MR execution, default-branch CI proactive work, Webhooks, multi-project dispatch and automatic merge are not. Polling scans full paginated project objects and discussions, with subscriptions first; increase the interval for larger projects. Failed reads retain the relevant cursors. Local fixture checks do not certify every GitLab version: complete real-instance discussion, push and merge checks on your target installation.
+One state directory serves one HTTPS instance and one project, including nested groups. Configuring your fork as that project is supported. The provider handles same-project MRs and requires human merge. Polling mode scans paginated project objects and discussions, with subscriptions first. Webhook mode processes supported project events and reconciles active tickets only. Failed reads retain the relevant cursors. Complete real-instance webhook, discussion, push and merge checks on your target installation.

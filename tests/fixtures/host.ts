@@ -6,6 +6,7 @@ import { Context } from '@deepseek-ai/cordis'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { Readable } from 'node:stream'
 import { vi, type Mock } from 'vitest'
 import type { UserMessage } from '@deepseek-ai/dsh-llm'
 import { Runtime } from '../../src/app/runtime.ts'
@@ -166,7 +167,7 @@ export async function startRuntime(seed?: (store: Store) => void, provider: 'git
   const steps = new Map<string, () => void>(), claims = new Map<string, () => void>()
   const tools = new Map<string, Map<string, RegisteredTool>>()
   const deliveries = vi.fn<(request: Delivery) => void>()
-  let http!: HttpHandler
+  const http = new Map<string, HttpHandler>()
   const resolveDefault = async (id: string) => agents.has(id) ? { agent: agents.get(id) } : { error: { code: 'session/not-found' } }
   const controller = {
     create: vi.fn(async ({ sessionId }: { sessionId: string }) => {
@@ -236,7 +237,10 @@ export async function startRuntime(seed?: (store: Store) => void, provider: 'git
   }
   const reader = { read: async () => ({ events: [] }), [Symbol.asyncDispose]: async () => {} }
   const persistence = { flush: vi.fn(async () => {}), open: vi.fn(async () => reader) }
-  const webServer = { host: '127.0.0.1', port: 3082, register: (route: { handler: HttpHandler }) => { http = route.handler; return () => {} } }
+  const webServer = { host: '127.0.0.1', port: 3082, register: (route: { path: string; handler: HttpHandler }) => {
+    http.set(route.path, route.handler)
+    return () => { http.delete(route.path) }
+  } }
   const jobs = jobRegistry(id => agents.get(id))
   const subagents = subagentRuntime(agents)
   const services = { agents, llm: { resolveCallConfig: vi.fn(async (value: unknown) => value) }, sessionController: controller,
@@ -290,11 +294,17 @@ export async function startRuntime(seed?: (store: Store) => void, provider: 'git
     const ticket = runtime.store.tickets.get((result.ticket as { ticket_id: string }).ticket_id)!
     return { trigger, ticket, sessionId: `worker-${ticket.id}` }
   }
-  async function api(method: string, path: string, json?: unknown) {
+  async function request(method: string, url: string, json?: unknown, headers: Record<string, string> = {}) {
     let status = 0, text = ''
     const chunks = json === undefined ? [] : [Buffer.from(JSON.stringify(json))]
-    const req = { method, url: `/orchestrator/api/${path}`, headers: { host: '127.0.0.1:3082', 'x-orchestrator-request': '1' }, async *[Symbol.asyncIterator]() { yield* chunks } }
-    await http(req, { writeHead: (code: number) => { status = code }, end: (data: string) => { text = data } })
+    const route = [...http].find(([path]) => url === path || url.startsWith(path + '/'))
+    if (!route) return { status: 404, text }
+    const req = Object.assign(Readable.from(chunks), { method, url, headers })
+    await route[1](req, { writeHead: (code: number) => { status = code }, end: (data = '') => { text = data } })
+    return { status, text }
+  }
+  async function api(method: string, path: string, json?: unknown) {
+    const { status, text } = await request(method, `/orchestrator/api/${path}`, json, { host: '127.0.0.1:3082', 'x-orchestrator-request': '1' })
     return { status, body: JSON.parse(text) as Record<string, unknown> }
   }
   async function stop() { await runtime.stop(); vi.restoreAllMocks(); rmSync(directory, { recursive: true, force: true }) }
@@ -302,7 +312,7 @@ export async function startRuntime(seed?: (store: Store) => void, provider: 'git
   const step = (sessionId: string) => { steps.get(sessionId)!() }
   /** A step of the worker claims what waits for it, and is cut off before the Session took it. */
   const claim = (sessionId: string) => { claims.get(sessionId)!() }
-  return { runtime, ctx, directory, answers, agents, tools, deliveries, relays, candidates, runTool, route, acceptedTicket, api, controller, subprocess, hooks, resolveDefault, stop,
+  return { runtime, ctx, directory, answers, agents, tools, deliveries, relays, candidates, runTool, route, acceptedTicket, api, request, controller, subprocess, hooks, resolveDefault, stop,
     jobs, subagents, step, claim }
 }
 export type Host = Awaited<ReturnType<typeof startRuntime>>

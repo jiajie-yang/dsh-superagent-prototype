@@ -322,6 +322,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/store-read.ts` | `storeReads`: the Store's read queries for the views, the tools and the Sources' polls, which never write |
 | `src/app/migration.ts` | The schema 11 migration: one step from schema 10 that writes every stored record in its current shape |
 | `src/app/effects.ts` | Effects |
+| `src/app/gitlab-webhook.ts` | Authenticated project Webhook ingress and atomic delivery deduplication |
 | `src/app/versions.ts` | `Versions`: a record kept as numbered snapshots with a pointer to the current one, for the settings and the prompts |
 | `src/app/cache.ts` | `TextCache`: texts kept in memory within a size, the least recently used dropped first |
 | `src/app/settings.ts` | Settings |
@@ -397,7 +398,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/client/locales.ts` | All copy in both languages, and the glossary of [001 Domain model](001-domain.md) |
 | `src/client/client.css`, `css.d.ts` | The panel's stylesheet, loaded as text |
 | `src/gitlab-deployment.ts` | GitLab instance, project, dedicated CLI and account resolution |
-| `src/sources/gitlab.ts` | GitLab Source configuration, Trigger conversion and polling |
+| `src/sources/gitlab.ts` | GitLab Source configuration, Trigger conversion, webhook processing and polling |
 | `src/sources/gitlab-read.ts` | GitLab validated original resources and discussion pagination |
 | `src/sources/gitlab-channel.ts` | GitLab idempotent comments and discussion replies |
 | `src/sources/gitlab-merge.ts` | GitLab MR ownership, binding and terminal notices |
@@ -450,6 +451,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/class-docs.spec.ts` | Every class in `src` has a JSDoc block before it |
 | `tests/gitlab.spec.ts` | GitLab events, policy, persistence, MR ownership, replies, configuration and prompts |
 | `tests/gitlab-prepare.spec.ts` | GitLab workspace preparation with a mocked API and local Git transport |
+| `tests/gitlab-webhook.spec.ts` | GitLab Webhook authentication, scoped reads, durable retries and lifecycle |
 | `tests/glab-wrapper.spec.ts` | The documented instance wrapper: credential and API environment pins, file failures, rotation, Git helper and instance separation |
 | `tests/docs.spec.ts` | Numbered documents link only to earlier ones, every local link resolves, no document has merge conflict markers, and this document's tables list every module and every test |
 
@@ -468,6 +470,7 @@ One SQLite file, `<stateDir>/orchestrator.sqlite`, which only the Store opens.
 | `ticket` | Tickets with their Mandate, origin, execution, Assignments, Channels, Inputs and the Threads they follow; the generated columns `open`, set while it has not ended, and `active`, set while Inputs are undelivered or the latest Assignment is pending or running | Engine |
 | `decision` | Decisions, by Thread | Engine |
 | `effect` | The effect queue: per kind and key, the payload, its order, failed attempts with the last error, and when it is due | Effects; the schema 11 migration queues what earlier versions kept for the main Session |
+| `gitlab_hook_receipt` | Delivery deduplication keys and receipt times, with a 14-day retention window | GitLab Webhook ingress |
 | `outbox` | The receipt of each message for a Channel, by id, with the Ticket it is for and its `status`, `pending`, `sent` or `dropped`, kept so an id is never queued twice; for a dropped message, when and why, as the generated column `dropped`, its time, and a reason code. A message that waits has a `reply` effect, which holds its attempts | The Outbox |
 | `kv` | Every other record, by key | The part that names it |
 

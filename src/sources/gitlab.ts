@@ -9,7 +9,7 @@ import type { SourceKind } from './kind.ts'
 import { sourceContext, type SourceContext } from './host.ts'
 import { pause, polled, cursorAt } from './poll.ts'
 import { gitlabPages, ObjectSchema, DiscussionSchema, collection, objectPath, readMerge, gitlabThreadContext, type GitlabObject, type ObjectKind } from './gitlab-read.ts'
-import { claimMerge, gitlabThread, observeMerge } from './gitlab-merge.ts'
+import { claimMerge, gitlabThread, gitlabWorktree, observeMerge } from './gitlab-merge.ts'
 import { sendGitlab } from './gitlab-channel.ts'
 
 export const GitlabConfigSchema = GitlabAccountsSchema.extend({ baseUrl: z.string().trim().refine(value => {
@@ -202,8 +202,19 @@ export const gitlabKind: SourceKind<GitlabConfig> = {
       ['issues', 'Issue', c.receiveAllIssues], ['mrs', 'MR', c.receiveAllMergeRequests], ['comments', '评论 / Comments', c.receiveAllComments],
     ].map(([id, label, all]) => ({ id: String(id), label: String(label), note: { zh: all ? '全部消息' : '仅 @', en: all ? 'All' : 'Mentions' }, cells: { listedUnaddressed: !!all, unlistedAddressed: true, unlistedUnaddressed: !!all } })) },
   },
-  environment: { variables: ['URL', 'PROJECT', 'AGENT', 'COMMIT_EMAIL'].map(name => ({ key: `DSH_SUPERAGENT_GITLAB_${name}`, description: { zh: `当前 GitLab ${name}`, en: `GitLab ${name}` } })),
-    values: ({ deployment }) => ({ DSH_SUPERAGENT_GITLAB_URL: deployment.gitlab?.baseUrl ?? '', DSH_SUPERAGENT_GITLAB_PROJECT: deployment.gitlab?.project ?? '', DSH_SUPERAGENT_GITLAB_AGENT: deployment.gitlab?.username ?? '', DSH_SUPERAGENT_GITLAB_COMMIT_EMAIL: deployment.gitlab?.email ?? '' }) },
+  environment: { variables: [
+    ...['URL', 'PROJECT', 'AGENT', 'COMMIT_EMAIL'].map(name => ({ key: `DSH_SUPERAGENT_GITLAB_${name}`, description: { zh: `当前 GitLab ${name}`, en: `GitLab ${name}` } })),
+    { key: 'DSH_SUPERAGENT_GITLAB_PROJECT_ID', description: { zh: '已绑定的 GitLab 项目数字 ID', en: 'Bound numeric GitLab project ID' } },
+    { key: 'DSH_SUPERAGENT_GITLAB_WORKTREE_MODE', description: { zh: '工作树准备模式：base、mr、resume 或 unknown', en: 'Worktree preparation mode: base, mr, resume, or unknown' } },
+    { key: 'DSH_SUPERAGENT_GITLAB_ORIGIN_MR_IID', description: { zh: '工单来源 MR 的项目内编号', en: 'Project-local IID of the ticket origin MR' } },
+  ], values: ({ deployment, ticket, trigger }) => {
+    const account = deployment.gitlab
+    const worktree = account && ticket ? gitlabWorktree(account, ticket, trigger) : undefined
+    return { DSH_SUPERAGENT_GITLAB_URL: account?.baseUrl ?? '', DSH_SUPERAGENT_GITLAB_PROJECT: account?.project ?? '',
+      DSH_SUPERAGENT_GITLAB_AGENT: account?.username ?? '', DSH_SUPERAGENT_GITLAB_COMMIT_EMAIL: account?.email ?? '',
+      DSH_SUPERAGENT_GITLAB_PROJECT_ID: String(account?.projectId ?? ''), DSH_SUPERAGENT_GITLAB_WORKTREE_MODE: worktree?.mode ?? '',
+      DSH_SUPERAGENT_GITLAB_ORIGIN_MR_IID: worktree?.mrIid ?? '' }
+  } },
   facts: (deployment): Record<string, string | { zh: string; en: string }> => deployment?.gitlab ? { cli: { zh: `当前账号 @${deployment.gitlab.username}；项目 ${deployment.gitlab.projectId}`, en: `Agent @${deployment.gitlab.username}; project ${deployment.gitlab.projectId}` } } : {},
 }
 /** Bind authorization to the resolved numeric project, keeping stored path labels rename-safe. */

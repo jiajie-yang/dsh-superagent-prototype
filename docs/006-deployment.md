@@ -406,21 +406,22 @@ git -c credential.helper= \
 
 Keep credentials and `http.*.extraheader` out of the clone's local `.git/config`; worker git uses the agent's generated HTTPS helper. Prepare the project's test tools and dependencies too: a working clone alone does not make tests runnable.
 
-In **Execution**, start with `maxWorkers: 1`, leave the directory root empty to use `<stateDir>/work`, and use a Prepare command like this. Replace the clone path and `main` with your intended base branch:
+In **Execution**, start with `maxWorkers: 1`, leave the directory root empty to use `<stateDir>/work`, and configure the Prepare command below. Replace both absolute paths and set `main` to the base branch for Issue and other non-MR tickets. Use the Node.js version required by this checkout and the dedicated clone created above.
 
 ```sh
-set -eu
-repo='/home/me/src/repository-agent'
-if [ -e "$DSH_SUPERAGENT_DIR/.git" ]; then
-  exit 0
-fi
-git -C "$repo" fetch --no-tags origin \
-  "refs/heads/main:refs/dsh-superagent/$DSH_SUPERAGENT_TICKET"
-git -C "$repo" worktree add -b "agent/$DSH_SUPERAGENT_NAME" \
-  "$DSH_SUPERAGENT_DIR" "refs/dsh-superagent/$DSH_SUPERAGENT_TICKET"
+exec node /home/me/src/dsh-superagent-prototype/scripts/gitlab-prepare.mjs \
+  /home/me/src/repository-agent main
 ```
 
-Each Ticket receives its own worktree and branch. A new MR-origin task may require the Executor to inspect or check out the MR's branch explicitly; this example prepares the configured base branch. Workers use the dedicated `glab` shim and report their MR with `mr_iid`.
+The helper uses the bound project ID and dedicated `glab` shim. It checks that the clone's fetch and push URLs resolve to that project's HTTPS clone URL. Each new ticket gets a separate local `agent/<ticket-name>` branch. For an MR-origin ticket it reads the open MR at Prepare time, requires both projects to match the deployment, checks that both branches exist, and verifies that the source branch's advertised and fetched commit match the MR API SHA. Fork MRs are outside this single-project deployment. A missing, moved or unverifiable source fails Prepare. Retry after GitLab converges or ask the operator to inspect the MR. A subsequent remote update leaves the pinned workspace intact.
+
+Review on an agent-created MR goes back to its existing ticket and workspace. Prepare never pushes, resets a branch or switches the workspace to the review event's head. A manual repeat accepts a worktree on the ticket branch that still contains its pinned base, including local edits and commits. A missing worktree with prior execution, an agent-owned MR, or a saved baseline fails and needs manual restoration. Inspect the ticket branch and `refs/dsh-superagent/bases/<ticket-id>` before repairing a partially created workspace. Preserve the work directory and the dedicated clone together.
+
+Before an MR-origin ticket's first launch, Executor runs Prepare even if an earlier attempt left a directory, then requires a registered linked worktree on the ticket branch with the saved baseline in its history. It checks the same conditions before resuming an MR-origin ticket or delivering review feedback for an agent-owned MR. Workspace checks remain active when the GitLab Source is disabled.
+
+If Prepare fails or is interrupted before a new Issue or other non-MR ticket starts, retry runs Prepare again even when it left a directory. Inspect a partial worktree and verify its baseline before restoring its pin.
+
+When upgrading, replace the old Prepare command before admitting new requests. An existing non-MR-origin ticket can reuse the previous example's `refs/dsh-superagent/<ticket-id>` ref. When reusing that ref or resuming a custom ticket branch, the Executor reads the bound agent-owned MR and checks its full source branch against the local branch. For an existing MR-origin ticket without a verified pin, an operator must verify the actual MR baseline before recording it in `refs/dsh-superagent/bases/<ticket-id>` or repairing the workspace. Workers deliver from the ticket branch and report the new MR with `mr_iid`. Leave the originating MR's source branch under its author's control.
 
 Review **Prompts → Delivery requirements**: use the agent's verified email and intended commit author, name the target branch and required project checks, retain the automation disclosure, and require human merge. GitLab defaults already use glab and manual merge; no GitHub auto-merge account is needed. Keep the default `observe` mode initially. It limits inferred work; **allowed users' explicit requests still execute**, so add the allowed list after execution setup is ready.
 
@@ -460,7 +461,7 @@ Expect `setup.problem: null`, runtime and GitLab health `ready`, only the GitLab
 
 Wait for the first successful GitLab poll, then from an allowed person's account post a **new** Issue/MR or comment mentioning `@<agent username>` with a small, specific task, its required checks and target branch. Ask for an MR without merging it. The first scan establishes a current-time baseline rather than importing all old messages. Edits without a verified editor are context only and cannot authorize new work as the original author; use a new comment for the test. The agent ignores its own messages.
 
-Verify the Ticket, worktree, execution Session, actual checks and MR creation. Add a new review discussion on the bound MR without mentioning the agent to check follow-up, then merge manually and verify the Ticket ends as `merged`. Pipeline feedback is context for an existing ticket, not an independent request.
+Verify the Ticket, worktree, execution Session, actual checks and MR creation. On a separate human-authored, same-project MR, verify that the initial worktree matches its API `sha` and the delivery branch is separate. Verify that deleting a source branch before Prepare yields a visible failure. Add a new review discussion on the agent's bound MR without mentioning the agent, and verify it reuses the ticket worktree. Check that the agent account can update its own branch while GitLab's protected branch settings restrict writes to shared branches. Then merge manually and verify the Ticket ends as `merged`. Pipeline feedback is context for an existing ticket, not an independent request.
 
 After foreground verification, press Ctrl+C and wait for DSH to exit before starting a background instance:
 

@@ -449,6 +449,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/locales.spec.ts`, `tests/styles.spec.ts` | The copy in both languages, the stylesheet |
 | `tests/class-docs.spec.ts` | Every class in `src` has a JSDoc block before it |
 | `tests/gitlab.spec.ts` | GitLab events, policy, persistence, MR ownership, replies, configuration and prompts |
+| `tests/gitlab-prepare.spec.ts` | GitLab workspace preparation with a mocked API and local Git transport |
 | `tests/glab-wrapper.spec.ts` | The documented instance wrapper: credential and API environment pins, file failures, rotation, Git helper and instance separation |
 | `tests/docs.spec.ts` | Numbered documents link only to earlier ones, every local link resolves, no document has merge conflict markers, and this document's tables list every module and every test |
 

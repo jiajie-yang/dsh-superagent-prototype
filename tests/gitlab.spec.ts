@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { mkdtempSync, rmSync, chmodSync, writeFileSync, readFileSync } from 'node:fs'
+import { execFileSync, spawnSync } from 'node:child_process'
+import { mkdtempSync, mkdirSync, rmSync, chmodSync, writeFileSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Store } from '../src/app/store.ts'
@@ -14,12 +15,14 @@ import { gitlabPages, gitlabThreadContext, readGitlab, readGitlabRepositoryPath,
 import { sendGitlab } from '../src/sources/gitlab-channel.ts'
 import { testDeployment, testMachine } from './fixtures/deployment.ts'
 import { deferred } from './fixtures/async.ts'
+import type { Host } from './fixtures/host.ts'
 import { KV } from '../src/kv.ts'
 import { githubKind } from '../src/sources/github.ts'
 import { Prompts } from '../src/app/prompts.ts'
 import { gitlabUrl, resolveGitlab } from '../src/gitlab-deployment.ts'
 import { Setup } from '../src/app/setup.ts'
 import { ticketCard } from '../src/app/cards.ts'
+import { ticketEnvironment } from '../src/app/execution-environment.ts'
 import { writeEnvironment, workerGitConfig } from '../src/infra/environment.ts'
 
 const dirs: string[] = [], stores: Store[] = []
@@ -49,6 +52,42 @@ function ticket(id: string): Ticket {
     execution: { name: id, directory: '/tmp/work', assignment: '' } }
 }
 const mr = (patch: Partial<GitlabObject> = {}) => object({ web_url: `${account.baseUrl}/${account.project}/-/merge_requests/3`, source_project_id: 42, target_project_id: 42, author: { id: 7, username: 'agent' }, source_branch: 'agent/task', ...patch })
+
+function localWorktree(host: Host, t: Ticket) {
+  const { directory, name } = t.execution!
+  const repo = join(host.directory, 'local-repo')
+  const git = (...args: string[]) => execFileSync('git', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim()
+  git('init', '-b', 'main', repo)
+  git('-C', repo, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test', 'commit', '--allow-empty', '-m', 'base')
+  git('-C', repo, 'worktree', 'add', '-b', `agent/${name}`, directory, 'HEAD')
+  const spawn = host.subprocess.spawn.getMockImplementation()!
+  host.subprocess.spawn.mockImplementation(spec => {
+    if (spec.argv[0] !== 'git' || !['rev-parse', 'symbolic-ref', 'show-ref', 'merge-base'].includes(spec.argv[1]!)) return spawn(spec)
+    const result = spawnSync('git', [...spec.argv.slice(1)], { cwd: directory, encoding: 'utf8' })
+    const reader = (value: string) => ({ readFrom: () => ({ text: value, nextOffset: value.length, lossy: false }) })
+    return { done: Promise.resolve({ exitCode: result.status ?? 1, signal: null }),
+      collected: { stdout: reader(result.stdout ?? ''), stderr: reader(result.stderr ?? '') } }
+  })
+  return (legacy = false) => git('-C', repo, 'update-ref', `refs/dsh-superagent/${legacy ? '' : 'bases/'}${t.id}`, 'HEAD')
+}
+
+it('derives Prepare inputs from the fixed origin and prefers preserving a previously used or MR-bound ticket', () => {
+  const h = harness(), t = ticket('task')
+  const input = { id: 'source-task', text: '@agent fix', at, userId: 9, username: 'alice' }
+  const issue = gitlabTrigger(h.ctx, 'issue', object(), input)!
+  const merge = gitlabTrigger(h.ctx, 'mr', mr(), input)!
+  const env = (trigger?: Trigger, record = t) => Object.fromEntries(ticketEnvironment({
+    sources: h.sources, deployment: h.deployment, settings: h.store.settings(), ticket: record, trigger,
+  }).map(({ key, value }) => [key, value]))
+  expect(env(issue)).toMatchObject({ DSH_SUPERAGENT_GITLAB_WORKTREE_MODE: 'base', DSH_SUPERAGENT_GITLAB_ORIGIN_MR_IID: '' })
+  expect(env(merge)).toMatchObject({ DSH_SUPERAGENT_GITLAB_WORKTREE_MODE: 'mr', DSH_SUPERAGENT_GITLAB_ORIGIN_MR_IID: '3', DSH_SUPERAGENT_GITLAB_PROJECT_ID: '42' })
+  expect(env({ ...merge, meta: { ...merge.meta, projectId: 43 } })).toMatchObject({ DSH_SUPERAGENT_GITLAB_WORKTREE_MODE: 'unknown' })
+  expect(env()).toMatchObject({ DSH_SUPERAGENT_GITLAB_WORKTREE_MODE: 'unknown' })
+  expect(env(issue, { ...t, follows: [{ thread: `gitlab:${merge.threads[0]!.id}`, own: true }] }))
+    .toMatchObject({ DSH_SUPERAGENT_GITLAB_WORKTREE_MODE: 'resume', DSH_SUPERAGENT_GITLAB_ORIGIN_MR_IID: '' })
+  expect(env(merge, { ...t, assignments: [{ id: 'old', state: 'ended', createdAt: at, startedAt: at }] }))
+    .toMatchObject({ DSH_SUPERAGENT_GITLAB_WORKTREE_MODE: 'resume', DSH_SUPERAGENT_GITLAB_ORIGIN_MR_IID: '3' })
+})
 
 describe('GitLab events and policy', () => {
   it('isolates instances, projects and issue/MR IDs; ignores the agent and evaluates allowed mentions', () => {
@@ -214,6 +253,7 @@ it('boots GitLab-only with GitHub installed and routes a Feishu task through wor
     await expect(settings.save('executor', { ...store.settings().executor, blockedCommands: ['glab'] },
       store.blockRevision('executor'), 'panel')).rejects.toThrow('glab cannot be blocked')
     const { ticket: t } = await h.acceptedTicket(feishu('1', '修复按钮'))
+    localWorktree(h, t)(true)
     const current = h.runtime.store.tickets.get(t.id)!
     const merge = mr({ source_branch: `agent/${current.execution!.name}`, author: { id: 7, username: 'agent-bot' } })
     vi.spyOn(Commands.prototype, 'gitlab').mockResolvedValue(merge)
@@ -228,6 +268,7 @@ it('boots GitLab-only with GitHub installed and routes a Feishu task through wor
     const followup = gitlabTrigger(h.runtime.context(gitlabKind), 'mr', merge, { id: 'review-note', text: '请补上验证', at: new Date().toISOString(), userId: 9, username: 'alice', noteId: 99, discussionId: 'd99' })!
     h.runtime.receive(followup); await h.runtime.idle()
     expect(h.runtime.store.tickets.get(t.id)?.inputs.some(i => i.kind === 'trigger' && i.triggerId === followup.id)).toBe(true)
+    expect(h.runtime.store.tickets.get(t.id)?.undelivered).toHaveLength(0)
     await h.runTool(session, 'orchestrator_report', { state: 'ready', summary: '已补齐验证', mr_iid: 3 })
     observeMerge(h.runtime.context(gitlabKind), { ...merge, state: 'merged', merged_at: new Date(Date.now() + 1000).toISOString() })
     await h.runtime.idle()
@@ -239,6 +280,75 @@ it('boots GitLab-only with GitHub installed and routes a Feishu task through wor
     h.answers[`${cli} api --hostname gitlab.example.com projects/acme%2Fother`] = JSON.stringify({ id: 43, path_with_namespace: 'acme/other', http_url_to_repo: 'https://gitlab.example.com/acme/other.git', permissions: { project_access: { access_level: 30 }, group_access: null } })
     await expect(h.runtime.settings.save('source:gitlab', { ...original, config: { ...original.config, project: 'acme/other' } }, h.runtime.store.blockRevision('source:gitlab'), 'panel')).rejects.toThrow('new state directory')
     expect(h.runtime.store.settings().sources.gitlab?.config.project).toBe('acme/widgets')
+  } finally { await h.stop() }
+})
+
+it.each(['missing', 'empty', 'disabled'])('blocks MR review delivery or retry with a %s workspace or Source', async scenario => {
+  const { startRuntime, feishu } = await import('./fixtures/host.ts')
+  const h = await startRuntime(undefined, 'gitlab')
+  try {
+    const { ticket: t, sessionId } = await h.acceptedTicket(feishu('1', '修复按钮'))
+    const merge = mr({ source_branch: `agent/${t.execution!.name}`, author: { id: 7, username: 'agent-bot' } })
+    vi.spyOn(Commands.prototype, 'gitlab').mockResolvedValue(merge)
+    await h.runTool(sessionId, 'orchestrator_report', { state: 'ready', summary: '已提交 MR', mr_iid: 3 })
+    rmSync(t.execution!.directory, { recursive: true })
+    const { store, settings } = h.runtime
+    if (scenario === 'empty') mkdirSync(t.execution!.directory)
+    if (scenario === 'disabled') {
+      await h.runTool(sessionId, 'orchestrator_report', { state: 'failed', summary: 'workspace lost' })
+      const source = store.settings().sources.gitlab!
+      await expect(settings.save('source:gitlab', { ...source, enabled: false }, store.blockRevision('source:gitlab'), 'panel'))
+        .resolves.toMatchObject({ restarting: false })
+      expect(h.runtime.ticketEnvironment(t).map(variable => variable.key)).not.toContain('DSH_SUPERAGENT_GITLAB_WORKTREE_MODE')
+    }
+    h.deliveries.mockClear()
+    const error = scenario === 'empty' ? 'not the pinned worktree' : 'workspace is missing'
+    if (scenario !== 'disabled') {
+      const review = gitlabTrigger(h.runtime.context(gitlabKind), 'mr', merge, { id: 'missing-workspace', text: '请补上验证',
+        at: new Date().toISOString(), userId: 9, username: 'alice', noteId: 100, discussionId: 'd100' })!
+      h.runtime.receive(review); await h.runtime.idle()
+      expect(store.tickets.get(t.id)).toMatchObject({ delivery: { error: expect.stringContaining(error) } })
+      expect(store.tickets.get(t.id)?.undelivered).toHaveLength(1)
+    }
+    expect(h.relays(sessionId)).toEqual([])
+    await expect(h.api('POST', `tickets/${t.id}/retry`)).resolves.toMatchObject({ status: 200 })
+    await h.runtime.idle()
+    expect(store.tickets.get(t.id)?.assignments.at(-1)?.report)
+      .toMatchObject({ state: 'failed', summary: expect.stringContaining(error) })
+  } finally { await h.stop() }
+})
+
+it('requires Prepare for a new MR ticket and passes its bound identity to the command on retry', async () => {
+  const { startRuntime } = await import('./fixtures/host.ts')
+  const h = await startRuntime(undefined, 'gitlab')
+  try {
+    const { store } = h.runtime
+    const settings = store.settings()
+    const { baseUrl } = h.runtime.deployment.gitlab!
+    store.saveSettings({ ...settings, policy: { ...settings.policy, sources: {
+      ...settings.policy.sources, gitlab: { allowed: [{ id: `${encodeURIComponent(baseUrl)}:9` }] },
+    } } })
+    vi.spyOn(Commands.prototype, 'gitlab').mockResolvedValue(mr())
+    const trigger = gitlabTrigger(h.runtime.context(gitlabKind), 'mr', mr(), { id: 'mr-prepare', text: '@agent-bot fix',
+      at: new Date().toISOString(), userId: 9, username: 'alice' })!
+    const { ticket: t } = await h.acceptedTicket(trigger)
+    expect(t.assignments.at(-1)?.report).toMatchObject({ state: 'failed', summary: expect.stringContaining('require a Prepare command') })
+    // An old Prepare can leave a valid linked worktree, but does not record the verified pin.
+    const pin = localWorktree(h, t)
+    pin(true)
+    const command = 'node /opt/dsh/scripts/gitlab-prepare.mjs /srv/repo main'
+    store.saveSettings({ ...store.settings(), executor: { ...store.settings().executor, prepare: command } })
+    h.runtime.engine.retryTicket(t.id); await h.runtime.idle()
+    expect(h.subprocess.spawn).toHaveBeenCalledWith(expect.objectContaining({
+      argv: ['sh', '-c', command],
+      env: expect.objectContaining({ DSH_SUPERAGENT_GITLAB_WORKTREE_MODE: 'mr', DSH_SUPERAGENT_GITLAB_PROJECT_ID: '42',
+        DSH_SUPERAGENT_GITLAB_ORIGIN_MR_IID: '3' }),
+    }))
+    expect(store.tickets.get(t.id)?.assignments.at(-1)?.report)
+      .toMatchObject({ state: 'failed', summary: expect.stringContaining('not the pinned worktree') })
+    pin()
+    h.runtime.engine.retryTicket(t.id); await h.runtime.idle()
+    expect(store.tickets.get(t.id)?.assignments.at(-1)?.state).toBe('running')
   } finally { await h.stop() }
 })
 

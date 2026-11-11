@@ -210,7 +210,7 @@ export class Runtime extends Service implements SourceHost {
   private async initialize(): Promise<void> {
     // Register management HTTP routes before setup completes so operators can fix setup problems in the UI.
     this.disposers.push(registerHttp(this.ctx, this.httpHost()))
-    if (this.machine.repositoryProvider === 'gitlab') this.disposers.push(registerGitlabWebhook(this.ctx, this))
+    if (this.machine.repositoryProvider === 'gitlab') this.disposers.push(registerGitlabWebhook(this.ctx, this, this.board.claim('gitlabWebhookReceiver')))
     const configured = await this.setup.run(this.store.settings())
     if (this.closing()) return
     if (!configured) {

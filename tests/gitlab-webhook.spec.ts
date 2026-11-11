@@ -1,4 +1,4 @@
-import { writeFileSync } from 'node:fs'
+import { chmodSync, unlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { expect, it, vi } from 'vitest'
 import type { Context } from '@deepseek-ai/cordis'
@@ -36,6 +36,37 @@ async function host() {
 const send = (h: Host, delivery: string, body: unknown, override: Record<string, string> = {}) =>
   h.request('POST', path, body, { ...headers, 'idempotency-key': delivery, ...override })
 const gitlabTriggers = (h: Host) => h.runtime.store.read.recentTriggers().filter(t => t.source === 'gitlab')
+
+it('reports receiver readiness before delivery and shows the last recorded receipt', async () => {
+  vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] })
+  let h: Host | undefined
+  try {
+    const current = h = await host()
+    const tokenPath = join(current.directory, 'gitlab-webhook-token')
+    const receiver = () => current.runtime.health.gitlabWebhookReceiver
+    unlinkSync(tokenPath)
+    vi.advanceTimersByTime(30_000)
+    expect(receiver()).toMatchObject({ state: 'error', detail: expect.stringContaining('0600') })
+    writeFileSync(tokenPath, token, { mode: 0o644 })
+    vi.advanceTimersByTime(30_000)
+    expect(receiver()).toMatchObject({ state: 'error', detail: expect.stringContaining('0644') })
+    expect(await send(current, 'unsafe', note(5, now()))).toMatchObject({ status: 503 })
+    chmodSync(tokenPath, 0o400)
+    vi.advanceTimersByTime(30_000)
+    expect(receiver()).toMatchObject({ state: 'starting' })
+    expect(await send(current, 'ignored', { object_kind: 'push', project: { id: 42 } })).toMatchObject({ status: 204 })
+    expect(receiver()?.state).toBe('starting')
+    const event = note(5, now())
+    const payload = { ...event, object_attributes: { ...event.object_attributes, note: 'ordinary comment' } }
+    expect(await send(current, 'accepted', payload)).toMatchObject({ status: 200 })
+    const recorded = receiver()
+    expect(recorded).toMatchObject({ state: 'ready', detail: expect.stringContaining('Last recorded') })
+    expect(await send(current, 'accepted', payload)).toMatchObject({ status: 200 })
+    expect(receiver()).toEqual(recorded)
+  } finally {
+    try { await h?.stop() } finally { vi.useRealTimers() }
+  }
+})
 
 it('authenticates the ingress, ignores other projects and queues only bounded requests on the webhook path', async () => {
   const h = await host()
@@ -184,7 +215,7 @@ it('reopens the durable inbox and backs off a rate-limited delivery without rese
   let store = new Store(db)
   let effects = new Effects(store, new HealthBoard())
   const mount = () => registerGitlabWebhook(fakeContext, { store, effects, machine: { stateDir: h.directory },
-    lifetime: h.runtime.lifetime, context: () => h.runtime.context(gitlabKind) })
+    lifetime: h.runtime.lifetime, context: () => h.runtime.context(gitlabKind) }, new HealthBoard().claim('receiver'))
   const deliver = async () => {
     const { Readable } = await import('node:stream')
     const at = now()
@@ -193,15 +224,17 @@ it('reopens the durable inbox and backs off a rate-limited delivery without rese
     await handler(req as never, { writeHead: (code: number) => { status = code }, end: () => {} } as never)
     return status
   }
+  let unmount: (() => void) | undefined
   try {
-    mount()
+    unmount = mount()
     expect(await deliver()).toBe(200)
     expect(effects.pending('gitlabWebhook')).toBe(true)
     await effects.drain()
+    unmount()
     store.close()
     store = new Store(db)
     effects = new Effects(store, new HealthBoard())
-    mount()
+    unmount = mount()
     const at = now()
     const api = vi.spyOn(Commands.prototype, 'gitlab').mockRejectedValueOnce(new CliError('rate limited', 429))
       .mockImplementation(async endpoint => (endpoint === 'issues/3' ? issue(at) : { id: 'd1', notes: [{
@@ -221,5 +254,5 @@ it('reopens the durable inbox and backs off a rate-limited delivery without rese
     await effects.idle()
     expect(effects.pending('gitlabWebhook')).toBe(false)
     expect(gitlabTriggers(h).filter(t => t.meta.noteId === 5)).toHaveLength(1)
-  } finally { await effects.drain(); store.close(); await h.stop() }
+  } finally { unmount?.(); await effects.drain(); store.close(); await h.stop() }
 })

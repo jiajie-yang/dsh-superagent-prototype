@@ -298,8 +298,8 @@ export const gitlabKind: SourceKind<GitlabConfig> = {
         : field === 'project' ? { zh: '例如 group/subgroup/repository，填写项目路径，不是完整 URL。', en: 'For example group/subgroup/repository: a project path, not a full URL.' }
           : { zh: '实例专用 glab 包装器的绝对路径；包装器读取该实例的私有令牌文件，不在此填写令牌。配置步骤见部署文档。', en: 'Absolute path to this instance\'s glab wrapper, which reads its private token file. Do not enter a token here. See the deployment guide.' } })),
     { key: 'pollSeconds', type: 'number', min: 30, max: 3600, label: { zh: '轮询间隔 / 秒', en: 'Poll seconds' }, advanced: true },
-    { key: 'webhookEnabled', type: 'switch', label: { zh: 'Webhook 接入', en: 'Webhook intake' }, advanced: true,
-      hint: { zh: '启用前配置项目 Webhook 和接收密钥。启用后至少间隔 15 分钟，仅补偿扫描活跃工单。', en: 'Configure the project webhook and receiver secret first. Reconciliation checks active tickets only, at intervals of at least 15 minutes.' } },
+    { key: 'webhookEnabled', type: 'switch', label: { zh: 'Webhook 接入', en: 'Webhook intake' },
+      hint: { zh: '项目较大或 API 配额紧张时启用。先准备密钥和 HTTPS 代理，再启用接收器，最后在 GitLab 创建项目 Webhook。关闭时使用全项目轮询。', en: 'Enable for large projects or tight API quotas. Prepare the secret and HTTPS proxy, enable the receiver here, then create the project hook in GitLab. Turning this off uses project-wide polling.' } },
     ...(['receiveAllIssues', 'receiveAllMergeRequests', 'receiveAllComments'] as const).map(field => ({ key: field, type: 'switch' as const, label: { zh: field === 'receiveAllIssues' ? '接收全部 Issue' : field === 'receiveAllMergeRequests' ? '接收全部 MR' : '接收全部评论', en: field } })),
   ],
   scope: ({ meta }, config) => {

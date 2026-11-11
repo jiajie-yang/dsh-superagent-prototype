@@ -17,6 +17,9 @@ export function sourceHealth(sources: SourceRegistry, instance: SourceInstance, 
     const entry = health[name]
     return { name, ...(!entry || (instance.enabled && entry.code === 'sourceOff') ? starting : entry) }
   })
+  if (instance.kind === 'gitlab' && instance.enabled && instance.config.webhookEnabled && health.gitlabWebhookReceiver) {
+    parts.push({ name: 'gitlabWebhookReceiver', ...health.gitlabWebhookReceiver })
+  }
   return { id: instance.id, title: kind?.title ?? { zh: instance.id, en: instance.id }, health: parts }
 }
 export interface SetupState {

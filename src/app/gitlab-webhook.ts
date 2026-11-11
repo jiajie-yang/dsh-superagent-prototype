@@ -80,7 +80,9 @@ function readToken(path: string): string {
   const fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK)
   try {
     const stat = fstatSync(fd)
-    if (!stat.isFile() || (stat.mode & 0o7777) !== 0o600) throw new Error('must be a regular file with mode 0600')
+    if (!stat.isFile()) throw new Error('must be a regular file')
+    const mode = stat.mode & 0o7777
+    if (mode !== 0o600 && mode !== 0o400) throw new Error(`mode ${mode.toString(8).padStart(4, '0')} is invalid; use 0600 or 0400`)
     // Allow a trailing line ending, but never read an unbounded file.
     const bytes = Buffer.alloc(515)
     if (stat.size >= bytes.length) throw new Error('must contain 1–512 bytes of token text')
@@ -110,7 +112,7 @@ export function registerGitlabWebhook(ctx: Context, host: WebhookHost, health: H
       return
     }
     try { readToken(tokenPath) } catch (error) {
-      const detail = (error as NodeJS.ErrnoException).code ? 'create a readable file with mode 0600' : (error as Error).message
+      const detail = (error as NodeJS.ErrnoException).code ? 'create a readable file with mode 0600 or 0400' : (error as Error).message
       health.set({ state: 'error', detail: `gitlab-webhook-token: ${detail}` })
       return
     }
@@ -161,16 +163,18 @@ export function registerGitlabWebhook(ctx: Context, host: WebhookHost, health: H
     const delivery = header(req, 'webhook-id') || header(req, 'idempotency-key')
     const receipt = key('gitlab-hook', account.baseUrl, String(account.projectId), delivery && delivery.length <= 256 ? delivery : key(raw))
     try {
-      store.atomic(() => {
+      const recorded = store.atomic(() => {
         if (now >= pruneAt) store.db.prepare('DELETE FROM gitlab_hook_receipt WHERE received < ?').run(now - RETENTION)
         const inserted = store.db.prepare('INSERT OR IGNORE INTO gitlab_hook_receipt (id, received) VALUES (?, ?)').run(receipt, now)
         if (inserted.changes && !effects.pending('gitlabWebhook', receipt)) effects.enqueue('gitlabWebhook', receipt, event)
+        return inserted.changes > 0
       })
       if (now >= pruneAt) pruneAt = now + DAY
+      if (recorded) refreshHealth()
     } catch { return reply(res, 503) }
     reply(res, 200)
   } })
   refreshHealth()
-  const timer = setInterval(refreshHealth, 2000).unref()
+  const timer = setInterval(refreshHealth, 30_000).unref()
   return () => { clearInterval(timer); unregister(); health.release() }
 }

@@ -38,26 +38,35 @@ const send = (h: Host, delivery: string, body: unknown, override: Record<string,
 const gitlabTriggers = (h: Host) => h.runtime.store.read.recentTriggers().filter(t => t.source === 'gitlab')
 
 it('reports receiver readiness before delivery and shows the last recorded receipt', async () => {
-  const h = await host()
-  const tokenPath = join(h.directory, 'gitlab-webhook-token')
-  const receiver = () => h.runtime.health.gitlabWebhookReceiver
-  const wait = { timeout: 5000 }
+  vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] })
+  let h: Host | undefined
   try {
+    const current = h = await host()
+    const tokenPath = join(current.directory, 'gitlab-webhook-token')
+    const receiver = () => current.runtime.health.gitlabWebhookReceiver
     unlinkSync(tokenPath)
-    await vi.waitFor(() => expect(receiver()).toMatchObject({ state: 'error', detail: expect.stringContaining('0600') }), wait)
-    writeFileSync(tokenPath, token, { mode: 0o600 })
-    chmodSync(tokenPath, 0o644)
-    expect(await send(h, 'unsafe', note(5, now()))).toMatchObject({ status: 503 })
-    chmodSync(tokenPath, 0o600)
-    await vi.waitFor(() => expect(receiver()).toMatchObject({ state: 'starting' }), wait)
-    expect(await send(h, 'ignored', { object_kind: 'push', project: { id: 42 } })).toMatchObject({ status: 204 })
+    vi.advanceTimersByTime(30_000)
+    expect(receiver()).toMatchObject({ state: 'error', detail: expect.stringContaining('0600') })
+    writeFileSync(tokenPath, token, { mode: 0o644 })
+    vi.advanceTimersByTime(30_000)
+    expect(receiver()).toMatchObject({ state: 'error', detail: expect.stringContaining('0644') })
+    expect(await send(current, 'unsafe', note(5, now()))).toMatchObject({ status: 503 })
+    chmodSync(tokenPath, 0o400)
+    vi.advanceTimersByTime(30_000)
+    expect(receiver()).toMatchObject({ state: 'starting' })
+    expect(await send(current, 'ignored', { object_kind: 'push', project: { id: 42 } })).toMatchObject({ status: 204 })
     expect(receiver()?.state).toBe('starting')
     const event = note(5, now())
-    expect(await send(h, 'accepted', { ...event, object_attributes: { ...event.object_attributes, note: 'ordinary comment' } }))
-      .toMatchObject({ status: 200 })
-    await vi.waitFor(() => expect(receiver()).toMatchObject({ state: 'ready', detail: expect.stringContaining('Last recorded') }), wait)
-  } finally { await h.stop() }
-}, 20_000)
+    const payload = { ...event, object_attributes: { ...event.object_attributes, note: 'ordinary comment' } }
+    expect(await send(current, 'accepted', payload)).toMatchObject({ status: 200 })
+    const recorded = receiver()
+    expect(recorded).toMatchObject({ state: 'ready', detail: expect.stringContaining('Last recorded') })
+    expect(await send(current, 'accepted', payload)).toMatchObject({ status: 200 })
+    expect(receiver()).toEqual(recorded)
+  } finally {
+    try { await h?.stop() } finally { vi.useRealTimers() }
+  }
+})
 
 it('authenticates the ingress, ignores other projects and queues only bounded requests on the webhook path', async () => {
   const h = await host()

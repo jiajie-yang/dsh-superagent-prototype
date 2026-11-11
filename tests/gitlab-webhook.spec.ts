@@ -51,6 +51,25 @@ it('authenticates the ingress, ignores other projects and queues only bounded re
   } finally { await h.stop() }
 })
 
+it('acknowledges unsupported GitLab payloads without queuing them and rejects malformed supported events', async () => {
+  const h = await host()
+  try {
+    const project = { id: 42 }
+    for (const kind of ['push', 'tag_push']) {
+      expect(await send(h, kind, { object_kind: kind, project })).toMatchObject({ status: 204 })
+    }
+    const event = note(5, now())
+    expect(await send(h, 'commit-note', { object_kind: 'note', project, object_attributes: {
+      ...event.object_attributes, noteable_type: 'Commit', noteable_id: null,
+    } })).toMatchObject({ status: 204 })
+    expect(await send(h, 'malformed-issue', { object_kind: 'issue', project })).toMatchObject({ status: 400 })
+    expect(await send(h, 'malformed-note', { ...event, object_attributes: { noteable_type: 'Issue' } }))
+      .toMatchObject({ status: 400 })
+    expect(h.runtime.effects.pending('gitlabWebhook')).toBe(false)
+    expect(gitlabTriggers(h)).toHaveLength(0)
+  } finally { await h.stop() }
+})
+
 it('uses scoped API reads, keeps the discussion ID, deduplicates retries and treats edits as context', async () => {
   const h = await host()
   try {
@@ -82,7 +101,7 @@ it('uses scoped API reads, keeps the discussion ID, deduplicates retries and tre
     ])
 
     const create = note(5, at)
-    const first = { ...create, object_attributes: { ...create.object_attributes, discussion_id: null } }
+    const first = { ...create, object_attributes: { ...create.object_attributes, discussion_id: null, noteable_id: null } }
     expect(await send(h, 'note', first)).toMatchObject({ status: 200 })
     await h.runtime.idle()
     const calls = read.mock.calls.length

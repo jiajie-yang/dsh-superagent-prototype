@@ -18,12 +18,13 @@ const MAX_BYTES = 256 * 1024
 const DAY = 24 * 3600_000
 const RETENTION = 14 * DAY
 const id = z.int().positive()
-const envelope = z.object({ object_kind: z.string(), project_id: id.optional(), project: z.object({ id }).optional(),
-  object_attributes: z.unknown() })
+const envelope = z.object({ object_kind: z.string().min(1), project_id: id.optional(), project: z.object({ id }).optional(),
+  object_attributes: z.unknown().optional() })
 const object = z.object({ iid: id, action: z.string(), target_project_id: id.optional(),
   author_id: id.optional(), title: z.string().optional(), description: z.string().nullish() })
 const parent = z.object({ id, iid: id, author_id: id.optional(), target_project_id: id.optional() })
-const comment = z.object({ id, noteable_type: z.string(), noteable_id: id.optional(), author_id: id.optional(),
+const noteTarget = z.object({ noteable_type: z.string().min(1) })
+const comment = noteTarget.extend({ id, noteable_id: id.nullish(), author_id: id.optional(),
   system: z.boolean().optional(), note: z.string().optional(), action: z.string().optional(),
   discussion_id: z.string().nullish() })
 
@@ -42,12 +43,13 @@ function normalize(raw: unknown, account: GitlabAccount, receivedAt: string): Gi
           ? { openHash: key(String(attrs.author_id), attrs.title, attrs.description ?? '') } : {} }
   }
   if (event.object_kind !== 'note') return
+  const { noteable_type } = noteTarget.parse(event.object_attributes)
+  const kind = noteable_type === 'Issue' ? 'issue' : noteable_type === 'MergeRequest' ? 'mr' : undefined
+  if (!kind) return
   const note = comment.parse(event.object_attributes)
   if (note.system || note.author_id === account.userId || (note.action && !['create', 'update'].includes(note.action))) return
-  const kind = note.noteable_type === 'Issue' ? 'issue' : note.noteable_type === 'MergeRequest' ? 'mr' : undefined
-  if (!kind) return
   const target = parent.parse((raw as Record<string, unknown>)[kind === 'issue' ? 'issue' : 'merge_request'])
-  if ((note.noteable_id !== undefined && note.noteable_id !== target.id) ||
+  if ((note.noteable_id != null && note.noteable_id !== target.id) ||
       (target.target_project_id !== undefined && target.target_project_id !== account.projectId)) return
   return { kind, iid: target.iid, receivedAt, note: {
     id: note.id, discussionId: /^[a-zA-Z0-9_-]{1,128}$/.test(note.discussion_id ?? '') ? note.discussion_id! : undefined,

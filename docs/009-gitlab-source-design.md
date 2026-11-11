@@ -40,7 +40,7 @@ The first poll persists a current-time baseline before network access. Each obje
 
 Body snapshots keep a hash, remote update time and monotonic revision. Body intake and observation changes commit in the same synchronous Store transaction, including evaluation scheduling after commit. An observed `A → B → A` produces distinct versions; stale or unchanged snapshots do not replay work. Intermediate edits never seen by polling cannot be reconstructed.
 
-In Webhook mode, the receiver on `POST /webhooks/gitlab` authenticates the project and commits a receipt and a queued effect together. The effect holds routing identifiers and fetches current objects and relevant notes using the Agent's project access. Polling and webhooks share trigger IDs and admission rules. Reconciliation reads only threads with live tickets, and GitLab delivery replay can recover events that missed ingress. See the [deployment guide](006-deployment.md#6-enable-project-webhooks-optional) for setup.
+In Webhook mode, the receiver on `POST /webhooks/gitlab` authenticates the project and commits a receipt and a queued effect together. The effect holds routing identifiers and fetches current objects and relevant notes using the Agent's project access. Polling and webhooks share trigger IDs and admission rules. Reconciliation reads only threads with live tickets, and GitLab delivery replay can recover events that missed ingress. See the [deployment guide](006-deployment.md#6-configure-webhook-intake) for setup.
 
 ## Replies and MR lifecycle
 

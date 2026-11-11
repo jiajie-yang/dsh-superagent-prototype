@@ -1,6 +1,6 @@
 /** Authenticated GitLab ingress, separate from the loopback management API. */
 import { timingSafeEqual } from 'node:crypto'
-import { readFile } from 'node:fs/promises'
+import { closeSync, constants, fstatSync, openSync, readSync } from 'node:fs'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
@@ -10,6 +10,7 @@ import type { GitlabAccount } from '../deployment.ts'
 import { gitlabKind, gitlabMention, processGitlabHook, type GitlabConfig, type GitlabHookEvent } from '../sources/gitlab.ts'
 import { gitlabCoolingDown } from '../sources/gitlab-read.ts'
 import type { SourceContext } from '../sources/host.ts'
+import type { HealthEntry } from '../infra/health.ts'
 import type { Effects } from './effects.ts'
 import type { Store } from './store.ts'
 
@@ -75,8 +76,23 @@ function header(req: IncomingMessage, name: string): string | undefined {
   return typeof value === 'string' ? value : undefined
 }
 
+function readToken(path: string): string {
+  const fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK)
+  try {
+    const stat = fstatSync(fd)
+    if (!stat.isFile() || (stat.mode & 0o7777) !== 0o600) throw new Error('must be a regular file with mode 0600')
+    // Allow a trailing line ending, but never read an unbounded file.
+    const bytes = Buffer.alloc(515)
+    if (stat.size >= bytes.length) throw new Error('must contain 1–512 bytes of token text')
+    const length = readSync(fd, bytes, 0, bytes.length, 0)
+    const token = bytes.toString('utf8', 0, length).trim()
+    if (length >= bytes.length || !token || Buffer.byteLength(token) > 512) throw new Error('must contain 1–512 bytes of token text')
+    return token
+  } finally { closeSync(fd) }
+}
+
 /** Mount the receiver on the existing loopback listener. Only this path needs an HTTPS reverse proxy. */
-export function registerGitlabWebhook(ctx: Context, host: WebhookHost): () => void {
+export function registerGitlabWebhook(ctx: Context, host: WebhookHost, health: HealthEntry): () => void {
   const { store, effects, lifetime } = host
   const source = () => host.context(gitlabKind)
   const enabled = (source: SourceContext) => !lifetime.aborted && source.configured() && !!source.config<GitlabConfig>('gitlab')?.webhookEnabled
@@ -86,8 +102,30 @@ export function registerGitlabWebhook(ctx: Context, host: WebhookHost): () => vo
       return enabled(current) && !gitlabCoolingDown(current.commands) ? 1 : 0
     }, retry: [5000, 300_000],
   })
+  const tokenPath = join(host.machine.stateDir, 'gitlab-webhook-token')
+  function refreshHealth() {
+    const current = source()
+    if (!enabled(current)) {
+      health.set({ state: 'paused', detail: 'GitLab webhook intake is off or setup is incomplete' })
+      return
+    }
+    try { readToken(tokenPath) } catch (error) {
+      const detail = (error as NodeJS.ErrnoException).code ? 'create a readable file with mode 0600' : (error as Error).message
+      health.set({ state: 'error', detail: `gitlab-webhook-token: ${detail}` })
+      return
+    }
+    try {
+      const last = store.db.prepare('SELECT MAX(received) AS received FROM gitlab_hook_receipt WHERE received >= ?')
+        .get(Date.now() - RETENTION)?.received
+      health.set(last == null
+        ? { state: 'starting', detail: 'No recorded GitLab webhook delivery in the past 14 days. Send a test event.' }
+        : { state: 'ready', detail: `Last recorded GitLab webhook delivery: ${new Date(Number(last)).toISOString()}` })
+    } catch {
+      health.set({ state: 'error', detail: 'Unable to read GitLab webhook delivery receipts' })
+    }
+  }
   let pruneAt = 0
-  return ctx.webServer.register({ kind: 'prefix', path: PATH, handler: async (req, res) => {
+  const unregister = ctx.webServer.register({ kind: 'prefix', path: PATH, handler: async (req, res) => {
     if (req.url !== PATH) return reply(res, 404)
     if (req.method !== 'POST') return reply(res, 405)
     const current = source()
@@ -96,8 +134,8 @@ export function registerGitlabWebhook(ctx: Context, host: WebhookHost): () => vo
     if (!account || !enabled(current)) return reply(res, 404)
     const token = header(req, 'x-gitlab-token')
     if (!token || token.length > 512) return reply(res, 401)
-    const expected = await readFile(join(host.machine.stateDir, 'gitlab-webhook-token'), 'utf8').then(value => value.trim(), () => '')
-    if (!expected || expected.length > 512) return reply(res, 503)
+    let expected: string
+    try { expected = readToken(tokenPath) } catch { return reply(res, 503) }
     const providedBytes = Buffer.from(token), expectedBytes = Buffer.from(expected)
     if (providedBytes.length !== expectedBytes.length || !timingSafeEqual(providedBytes, expectedBytes)) return reply(res, 401)
     const instance = header(req, 'x-gitlab-instance')
@@ -132,4 +170,7 @@ export function registerGitlabWebhook(ctx: Context, host: WebhookHost): () => vo
     } catch { return reply(res, 503) }
     reply(res, 200)
   } })
+  refreshHealth()
+  const timer = setInterval(refreshHealth, 2000).unref()
+  return () => { clearInterval(timer); unregister(); health.release() }
 }

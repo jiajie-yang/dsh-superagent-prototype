@@ -38,6 +38,7 @@ const TEXT = {
   'health.runtime': ['dsh-superagent', 'dsh-superagent'],
   'health.models': ['模型服务', 'Model service'],
   'health.assessment': ['发给主 Session 的评估', 'Evals sent to the main Session'],
+  'health.gitlabWebhookReceiver': ['GitLab Webhook 接收器', 'GitLab webhook receiver'],
   'health.gitlabWebhook': ['GitLab Webhook 处理', 'GitLab webhook processing'],
   'health.launch': ['派工启动', 'Assignment launches'],
   'health.delivery': ['输入送达', 'Input delivery to Assignments'],

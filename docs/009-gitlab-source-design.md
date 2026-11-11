@@ -6,7 +6,7 @@ This document describes the implemented GitLab adapter and its boundaries. For i
 
 A deployment works on one repository provider at a time: GitHub by default, or GitLab with `repositoryProvider: gitlab` in the main plugin configuration. Feishu remains an optional message Source. GitLab supports one HTTPS instance at its domain root, one project (including nested groups), and one dedicated agent identity. People merge every MR.
 
-GitLab's Source configuration contains `baseUrl`, `project`, `cli`, `pollSeconds` and the three `receiveAll*` switches. It uses the existing `source:gitlab` settings block, revision checks, history and generated Source panel. `baseUrl`, `project` and `cli` changes are probed before saving and trigger a restart. The bundle includes the GitLab plugin disabled by default; the GitLab-only profile template enables it and disables GitHub and Feishu.
+GitLab's Source configuration contains `baseUrl`, `project`, `cli`, `pollSeconds`, `webhookEnabled` and the three `receiveAll*` switches. It uses the existing `source:gitlab` settings block, revision checks, history and generated Source panel. `baseUrl`, `project` and `cli` changes are probed before saving and trigger a restart. The bundle includes the GitLab plugin disabled by default; the GitLab-only profile template enables it and disables GitHub and Feishu.
 
 The selected repository Source supplies account facts, skills and execution variables. The other repository Source stays inactive even when installed. Engine authorization, Ticket routing and execution remain shared; there is no repository-plugin framework or second settings system.
 
@@ -39,6 +39,8 @@ Polling prioritizes subscriptions, then scans all paginated project Issues/MRs a
 The first poll persists a current-time baseline before network access. Each object has its own cursor. Failed reads retain the relevant cursors while healthy objects continue; errors remain visible in health. Disabling the Source during a read stops intake and cursor advancement so unread notes can be retried after re-enabling it. Existing subscriptions retain the normal polling window from the shared domain model.
 
 Body snapshots keep a hash, remote update time and monotonic revision. Body intake and observation changes commit in the same synchronous Store transaction, including evaluation scheduling after commit. An observed `A → B → A` produces distinct versions; stale or unchanged snapshots do not replay work. Intermediate edits never seen by polling cannot be reconstructed.
+
+In Webhook mode, the receiver on `POST /webhooks/gitlab` authenticates the project and commits a receipt and a queued effect together. The effect holds routing identifiers and fetches current objects and relevant notes using the Agent's project access. Polling and webhooks share trigger IDs and admission rules. Reconciliation reads only threads with live tickets, and GitLab delivery replay can recover events that missed ingress. See the [deployment guide](006-deployment.md#6-enable-project-webhooks-optional) for setup.
 
 ## Replies and MR lifecycle
 
@@ -77,5 +79,5 @@ Remaining boundaries:
 - Merged-results pipeline SHA handling is covered by fixtures; the real project exercised matching head SHA feedback.
 - The first-pipeline-after-no-pipeline repair is covered by Engine/SQLite restart regressions, not an additional remote pipeline scenario.
 - Source-off races and special-character repository paths use local regressions.
-- Attachment model input, Webhooks, multi-project dispatch, default-branch proactive CI work and automatic merge remain outside scope.
+- Attachment model input, pipeline webhooks, multi-project dispatch, default-branch proactive CI work and automatic merge remain outside scope.
 - The service script's macOS Electron process-detection limitations are separate work; the tested deployment uses direct startup/tmux and HTTP health checks.

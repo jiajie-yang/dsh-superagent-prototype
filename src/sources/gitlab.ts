@@ -1,25 +1,27 @@
-/** Single-project GitLab Source. Full paginated discovery favors correctness over API volume. */
+/** Single-project GitLab Source with polling and webhook-driven intake. */
 import type { Context } from '@deepseek-ai/cordis'
 import { z } from 'zod'
 import { gitlabUrl } from '../gitlab-deployment.ts'
 import { GitlabAccountsSchema } from '../deployment.ts'
-import { key, type Trigger } from '../core/index.ts'
+import { key, liveTicket, type Trigger } from '../core/index.ts'
+import { CliError } from '../infra/commands.ts'
 import { KV } from '../kv.ts'
 import type { SourceKind } from './kind.ts'
 import { sourceContext, type SourceContext } from './host.ts'
 import { pause, polled, cursorAt } from './poll.ts'
-import { gitlabPages, ObjectSchema, DiscussionSchema, collection, objectPath, readMerge, gitlabThreadContext, type GitlabObject, type ObjectKind } from './gitlab-read.ts'
-import { claimMerge, gitlabThread, observeMerge } from './gitlab-merge.ts'
+import { gitlabCoolingDown, gitlabEventReads, gitlabPages, ObjectSchema, DiscussionSchema, collection, objectPath, readMerge, gitlabThreadContext,
+  type GitlabObject, type GitlabReads, type NoteSchema, type ObjectKind } from './gitlab-read.ts'
+import { claimMerge, gitlabThread, gitlabWorktree, observeMerge } from './gitlab-merge.ts'
 import { sendGitlab } from './gitlab-channel.ts'
 
 export const GitlabConfigSchema = GitlabAccountsSchema.extend({ baseUrl: z.string().trim().refine(value => {
   if (!value) return true
   try { gitlabUrl(value); return true } catch { return false }
 }, 'Use an HTTPS GitLab origin without a path or credentials').transform(value => value ? gitlabUrl(value) : '').default(''), pollSeconds: z.number().int().min(30).max(3600).default(60),
-  receiveAllIssues: z.boolean().default(false), receiveAllMergeRequests: z.boolean().default(false), receiveAllComments: z.boolean().default(false) }).strict()
+  webhookEnabled: z.boolean().default(false), receiveAllIssues: z.boolean().default(false), receiveAllMergeRequests: z.boolean().default(false), receiveAllComments: z.boolean().default(false) }).strict()
 export type GitlabConfig = z.infer<typeof GitlabConfigSchema>
 const actorId = (instance: string, id: number) => `${encodeURIComponent(instance)}:${id}`
-const addressed = (text: string, username: string): boolean => new RegExp(`(^|[^\\w@])@${username.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![\\w.-])`).test(text)
+export const gitlabMention = (text: string, username: string): boolean => new RegExp(`(^|[^\\w@])@${username.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![\\w.-])`).test(text)
 export function gitlabTrigger(ctx: SourceContext, kind: ObjectKind, object: GitlabObject, input: {
   id: string; text: string; at: string; userId: number; username: string; bot?: boolean; noteId?: number; discussionId?: string; contextOnly?: boolean
 }): Trigger | undefined {
@@ -29,49 +31,158 @@ export function gitlabTrigger(ctx: SourceContext, kind: ObjectKind, object: Gitl
   const url = object.web_url + (input.noteId ? `#note_${input.noteId}` : '')
   return { id: input.id, source: 'gitlab', threads: [{ source: 'gitlab', id: thread }],
     actor: { source: 'gitlab', id: input.contextOnly ? '' : actorId(a.baseUrl, input.userId) }, human: !input.bot && !ctx.listedBot?.(actorId(a.baseUrl, input.userId)) && !input.contextOnly,
-    ...!input.contextOnly && addressed(input.text, a.username) ? { addressed: 'mention' as const } : {}, text: input.text, at: input.at, url,
+    ...!input.contextOnly && gitlabMention(input.text, a.username) ? { addressed: 'mention' as const } : {}, text: input.text, at: input.at, url,
     channel: { source: 'gitlab', thread: `gitlab:${thread}`, address: { instance: a.baseUrl, projectId: String(a.projectId), objectKind: kind, iid: String(object.iid), url,
       ...input.discussionId ? { discussionId: input.discussionId } : {} } },
     meta: { instance: a.baseUrl, project: ctx.config<GitlabConfig>('gitlab')?.project, projectId: a.projectId, objectKind: kind, iid: object.iid, noteId: input.noteId,
-      mentioned: addressed(input.text, a.username), row: input.noteId ? 'comments' : kind === 'mr' ? 'mrs' : 'issues', contextOnly: !!input.contextOnly,
+      mentioned: gitlabMention(input.text, a.username), row: input.noteId ? 'comments' : kind === 'mr' ? 'mrs' : 'issues', contextOnly: !!input.contextOnly,
       ...input.discussionId ? { discussionId: input.discussionId } : {} } }
 }
 /** Commit observed body and Trigger together; async receive adapters are rejected and rolled back. */
-export function observeBody(ctx: SourceContext, kind: ObjectKind, object: GitlabObject, since: string): void {
+export function observeBody(ctx: SourceContext, kind: ObjectKind, object: GitlabObject, since: string, contextOnly = false, confirmedOpen = false): void {
   const a = ctx.deployment.gitlab!
   const id = gitlabThread(a.baseUrl, a.projectId, kind, object.iid), stateKey = KV.gitlab.body(id)
   const text = `${object.title}\n${object.description ?? ''}`, hash = key(text)
   ctx.atomic(() => {
     const old = ctx.state.get(stateKey)
     if (old && Date.parse(object.updated_at) < Date.parse(old.updatedAt)) return
+    const emit = (triggerId: string, edit: boolean) => {
+      const trigger = gitlabTrigger(ctx, kind, object, { id: triggerId, text,
+        at: edit ? object.updated_at : object.created_at, userId: object.author.id, username: object.author.username,
+        bot: object.author.bot, contextOnly: edit })
+      if (trigger && Date.parse(trigger.at) >= Date.parse(since)) {
+        const result = ctx.receive(trigger)
+        if (result instanceof Promise) throw new Error('Body observation requires synchronous receive')
+      }
+    }
+    if (confirmedOpen) {
+      // A prior context snapshot must not consume the opening. Preserve deduplication with polling's original opening ID.
+      const prior = ctx.triggers.get(key('gitlab-body', id, '1'))
+      const opening = key('gitlab-body-open', id)
+      if ((!prior || prior.meta.contextOnly) && !ctx.triggers.get(opening)) emit(opening, false)
+    }
     if (old?.hash === hash) { ctx.state.set(stateKey, { ...old, updatedAt: object.updated_at }); return }
     const revision = (old?.revision ?? 0) + 1
     // Edits lack a trustworthy editor identity: context only, never authorize as the original author.
-    const edit = !!old || object.updated_at !== object.created_at
-    const trigger = gitlabTrigger(ctx, kind, object, { id: key('gitlab-body', id, String(revision)), text,
-      at: edit ? object.updated_at : object.created_at, userId: object.author.id, username: object.author.username,
-      bot: object.author.bot, contextOnly: edit })
-    if (trigger && Date.parse(trigger.at) >= Date.parse(since)) {
-      const result = ctx.receive(trigger)
-      if (result instanceof Promise) throw new Error('Body observation requires synchronous receive')
-    }
+    if (!confirmedOpen) emit(key('gitlab-body', id, String(revision)), contextOnly || !!old || object.updated_at !== object.created_at)
     ctx.state.set(stateKey, { hash, revision, updatedAt: object.updated_at })
   })
 }
-async function receiveObject(ctx: SourceContext, kind: ObjectKind, object: GitlabObject, since: string, signal?: AbortSignal, projectScan = false): Promise<void> {
-  const commands = ctx.commands.withSignal(signal)
-  observeBody(ctx, kind, object, since)
+async function receiveObject(ctx: SourceContext, kind: ObjectKind, object: GitlabObject, since: string, signal?: AbortSignal, projectScan = false, contextOnly = false): Promise<void> {
+  const commands = gitlabEventReads(ctx.commands, signal)
+  observeBody(ctx, kind, object, since, contextOnly)
   const discussions = await gitlabPages(commands, DiscussionSchema, `${objectPath(kind, object.iid)}/discussions`)
-  const a = ctx.deployment.gitlab!
   for (const d of discussions) for (const note of d.notes) {
     signal?.throwIfAborted()
     if (!ctx.config('gitlab')) throw new Error('GitLab poll stopped')
     if (note.system || Date.parse(note.updated_at) < Date.parse(since)) continue
-    const trigger = gitlabTrigger(ctx, kind, object, { id: key('gitlab-note', a.baseUrl, String(a.projectId), kind, String(note.id), note.updated_at, key(note.body)),
-      text: note.body, at: note.updated_at, userId: note.author.id, username: note.author.username, bot: note.author.bot, contextOnly: note.updated_at !== note.created_at,
-      noteId: note.id, discussionId: d.id })
-    if (trigger) await ctx.receive({ ...trigger, meta: { ...trigger.meta, projectScan } })
+    await receiveNote(ctx, kind, object, note, d.id, projectScan)
   }
+}
+async function receiveNote(ctx: SourceContext, kind: ObjectKind, object: GitlabObject, note: z.infer<typeof NoteSchema>, discussionId: string, projectScan: boolean, edit = false) {
+  const a = ctx.deployment.gitlab!
+  const trigger = gitlabTrigger(ctx, kind, object, { id: key('gitlab-note', a.baseUrl, String(a.projectId), kind, String(note.id), note.updated_at, key(note.body)),
+    text: note.body, at: note.updated_at, userId: note.author.id, username: note.author.username, bot: note.author.bot,
+    contextOnly: edit || note.updated_at !== note.created_at, noteId: note.id, discussionId })
+  if (trigger) await ctx.receive({ ...trigger, meta: { ...trigger.meta, projectScan } })
+}
+const boundMerge = (ctx: SourceContext, id: string) => ctx.tickets.open().some(t => t.follows?.some(f => !f.closed && f.thread === `gitlab:${id}`))
+async function refreshMergeLifecycle(ctx: SourceContext, commands: GitlabReads, iid: number, active: () => void) {
+  const latest = await readMerge(commands, iid)
+  active()
+  const projectId = ctx.deployment.gitlab!.projectId
+  if (latest.iid === iid && latest.source_project_id === projectId && latest.target_project_id === projectId) observeMerge(ctx, latest)
+}
+function describeObject(ctx: SourceContext, id: string, kind: ObjectKind, object: GitlabObject) {
+  ctx.threads.describe(`gitlab:${id}`, { label: `${kind === 'mr' ? '!' : '#'}${object.iid} ${object.title}`, url: object.web_url })
+}
+
+/** Only validated routing hints enter the durable queue. Author, text and current state are read with the agent's API access. */
+export interface GitlabHookEvent {
+  kind: ObjectKind
+  iid: number
+  receivedAt: string
+  contextOnly?: true
+  openHash?: string
+  note?: { id: number; discussionId?: string; edit: boolean; mentioned: boolean; agentMerge: boolean }
+}
+export async function processGitlabHook(ctx: SourceContext, event: GitlabHookEvent, signal: AbortSignal): Promise<void> {
+  const config = ctx.config<GitlabConfig>('gitlab'), a = ctx.deployment.gitlab
+  if (!config?.webhookEnabled || !a) throw new Error('GitLab webhook intake is off')
+  const { kind, iid, note } = event
+  const id = gitlabThread(a.baseUrl, a.projectId, kind, iid), thread = `gitlab:${id}`
+  const subscribed = () => {
+    const known = ctx.threads.get(thread)
+    return boundMerge(ctx, id) || (!!known?.subscriptions.length && polled(ctx, known))
+  }
+  if (note && !note.mentioned && !note.agentMerge && !config.receiveAllComments && !subscribed()) return
+  const commands = gitlabEventReads(ctx.commands, signal), path = objectPath(kind, iid)
+  const active = () => {
+    signal.throwIfAborted()
+    if (!ctx.config<GitlabConfig>('gitlab')?.webhookEnabled) throw new Error('GitLab webhook intake is off')
+  }
+  try {
+    const object = kind === 'mr' ? await readMerge(commands, iid) : ObjectSchema.parse(await commands.gitlab(path))
+    active()
+    if (object.iid !== iid) throw new Error('GitLab returned a different object')
+    if (kind === 'issue' && object.project_id !== undefined && object.project_id !== a.projectId) return
+    if (kind === 'mr' && (object.source_project_id !== a.projectId || object.target_project_id !== a.projectId)) return
+    if (kind === 'mr' && object.state === 'opened') observeMerge(ctx, object)
+    if (note) {
+      const discussion = await findHookDiscussion(ctx, commands, path, note.id, note.discussionId)
+      active()
+      const entry = discussion.notes.find(item => item.id === note.id)!
+      if (!entry.system) await receiveNote(ctx, kind, object, entry, discussion.id, !subscribed(), note.edit)
+    } else {
+      const savedBaseline = ctx.state.get(KV.gitlab.baseline)
+      // An accepted event may outlive a restart before the first reconciliation initializes its baseline.
+      const baseline = savedBaseline && savedBaseline <= event.receivedAt ? savedBaseline : cursorAt(event.receivedAt)
+      if (kind === 'mr' && object.state !== 'opened' && boundMerge(ctx, id)) {
+        // A terminal delivery can arrive before a review comment. Read that MR's unseen discussions before closing its ticket.
+        await receiveObject(ctx, kind, object, ctx.state.get(KV.gitlab.cursor(id)) ?? ctx.threads.get(thread)?.createdAt ?? baseline, signal, false, true)
+        await refreshMergeLifecycle(ctx, commands, iid, active)
+      } else {
+        const confirmed = !event.contextOnly && object.state === 'opened' && (event.openHash === undefined
+          ? object.created_at === object.updated_at
+          : event.openHash === key(String(object.author.id), object.title, object.description ?? ''))
+        observeBody(ctx, kind, object, baseline, !confirmed, confirmed)
+      }
+    }
+    describeObject(ctx, id, kind, object)
+  } catch (error) {
+    // An object or note removed before processing no longer authorizes work.
+    if (!(error instanceof CliError) || error.code !== 404) throw error
+  }
+}
+// Cache routing only. Every note's current content and author still come from a fresh API read.
+const discussionHints = new WeakMap<SourceContext['commands'], Map<string, string>>()
+async function findHookDiscussion(ctx: SourceContext, commands: GitlabReads, path: string, noteId: number, hint?: string) {
+  let hints = discussionHints.get(ctx.commands)
+  if (!hints) { hints = new Map(); discussionHints.set(ctx.commands, hints) }
+  const remember = (discussion: z.infer<typeof DiscussionSchema>) => {
+    for (const note of discussion.notes) hints.set(`${path}/${note.id}`, discussion.id)
+    while (hints.size > 4096) hints.delete(hints.keys().next().value!)
+  }
+  const cacheKey = `${path}/${noteId}`, discussionId = hint ?? hints.get(cacheKey)
+  if (discussionId) {
+    try {
+      const discussion = DiscussionSchema.parse(await commands.gitlab(`${path}/discussions/${discussionId}`))
+      remember(discussion)
+      if (discussion.notes.some(note => note.id === noteId)) return discussion
+    } catch (error) {
+      if (!(error instanceof CliError) || error.code !== 404) throw error
+    }
+    hints.delete(cacheKey)
+  }
+  for (let page = 1; page <= 10000; page++) {
+    const list = z.array(DiscussionSchema).parse(await commands.gitlab(`${path}/discussions?per_page=100&page=${page}`))
+    for (const discussion of list) remember(discussion)
+    const found = list.find(discussion => discussion.notes.some(note => note.id === noteId))
+    if (found) return found
+    if (list.length < 100) break
+  }
+  await commands.gitlab(`${path}/notes/${noteId}`)
+  throw new Error('The GitLab note exists but its discussion is not available yet')
 }
 async function observeCi(ctx: SourceContext, object: GitlabObject): Promise<void> {
   const a = ctx.deployment.gitlab!, p = object.head_pipeline
@@ -92,29 +203,32 @@ async function observeCi(ctx: SourceContext, object: GitlabObject): Promise<void
 }
 export async function pollGitlab(ctx: SourceContext, signal?: AbortSignal): Promise<void> {
   const a = ctx.deployment.gitlab
-  if (!a || !ctx.config('gitlab')) return
+  const config = ctx.config<GitlabConfig>('gitlab')
+  if (!a || !config || gitlabCoolingDown(ctx.commands)) return
   const started = new Date().toISOString()
   const since = ctx.state.get(KV.gitlab.since) ?? started
   if (!ctx.state.get(KV.gitlab.since)) ctx.state.set(KV.gitlab.since, since)
   const baseline = ctx.state.get(KV.gitlab.baseline) ?? since
   if (!ctx.state.get(KV.gitlab.baseline)) ctx.state.set(KV.gitlab.baseline, baseline)
-  const commands = ctx.commands.withSignal(signal)
+  const commands = gitlabEventReads(ctx.commands, signal)
   const visited = new Set<string>()
   const errors: unknown[] = []
   let completed = 0
   const active = () => {
     signal?.throwIfAborted()
-    if (!ctx.config('gitlab')) throw new Error('GitLab poll stopped')
+    const current = ctx.config<GitlabConfig>('gitlab')
+    if (!current || current.webhookEnabled !== config.webhookEnabled) throw new Error('GitLab poll stopped')
   }
   const failed = (error: unknown, id?: string) => {
     active()
     errors.push(error)
     if (id) ctx.threads.patch(`gitlab:${id}`, { pollError: String(error).slice(0, 300) })
+    if (error instanceof CliError && error.code === 429) throw error
   }
   const attempt = async (work: () => Promise<void>, id?: string) => {
     try { active(); await work(); active(); completed++ } catch (error) { failed(error, id) }
   }
-  const bound = (id: string) => ctx.tickets.open().some(t => t.follows?.some(f => !f.closed && f.thread === `gitlab:${id}`))
+  const bound = (id: string) => boundMerge(ctx, id)
   const process = async (kind: ObjectKind, object: GitlabObject, projectScan = true) => {
     active()
     const id = gitlabThread(a.baseUrl, a.projectId, kind, object.iid)
@@ -134,20 +248,27 @@ export async function pollGitlab(ctx: SourceContext, signal?: AbortSignal): Prom
       await receiveObject(ctx, kind, object, ctx.state.get(KV.gitlab.cursor(id)) ?? baseline, signal, projectScan && !(openedMerge && bound(id)))
     } catch (error) {
       active()
-      if (kind === 'mr' && !openedMerge) observeMerge(ctx, object)
+      if (kind === 'mr' && !openedMerge && !config.webhookEnabled) observeMerge(ctx, object)
       throw error
     }
     active()
     if (kind === 'mr') {
-      if (!openedMerge) observeMerge(ctx, object)
+      if (!openedMerge) {
+        if (!config.webhookEnabled) observeMerge(ctx, object)
+        else if (bound(id)) await refreshMergeLifecycle(ctx, commands, object.iid, active)
+      }
       if (openedMerge && bound(id)) await observeCi(ctx, object)
     }
     ctx.state.set(KV.gitlab.cursor(id), cursorAt(started))
     ctx.threads.patch(`gitlab:${id}`, { pollError: undefined })
-    ctx.threads.describe(`gitlab:${id}`, { label: `${kind === 'mr' ? '!' : '#'}${object.iid} ${object.title}`, url: object.web_url })
+    describeObject(ctx, id, kind, object)
   }
   // Priority to existing subscriptions. Closed tickets retain the shared two-week window.
-  for (const thread of ctx.threads.subscribed('gitlab').filter(t => polled(ctx, t))) {
+  for (const thread of ctx.threads.subscribed('gitlab')) {
+    if (config.webhookEnabled ? !thread.subscriptions.some(id => {
+      const ticket = ctx.tickets.get(id)
+      return ticket && liveTicket(ticket)
+    }) : !polled(ctx, thread)) continue
     const match = /:(issue|mr):(\d+)$/.exec(thread.ref.id)
     if (!match) continue
     const kind = match[1] as ObjectKind, iid = Number(match[2])
@@ -155,7 +276,7 @@ export async function pollGitlab(ctx: SourceContext, signal?: AbortSignal): Prom
   }
   // Read all object pages, then discussions: note updates need not advance the parent's updated_at.
   // This deliberately avoids relying on parent updated_after as an undocumented comment cursor.
-  for (const kind of ['issue', 'mr'] as const) {
+  if (!config.webhookEnabled) for (const kind of ['issue', 'mr'] as const) {
     await attempt(async () => {
       const objects = await gitlabPages(commands, ObjectSchema, `${collection(kind)}?state=all&order_by=updated_at&sort=asc`, error => failed(error))
       for (const object of objects) {
@@ -165,7 +286,8 @@ export async function pollGitlab(ctx: SourceContext, signal?: AbortSignal): Prom
   }
   if (errors.length && !completed) throw errors[0]
   if (!errors.length) ctx.state.set(KV.gitlab.since, cursorAt(started))
-  ctx.report('gitlab', { state: errors.length ? 'error' : 'ready', detail: errors.length ? `${errors.length} GitLab reads failed; healthy objects continue polling` : 'GitLab project and subscriptions polled', at: started })
+  ctx.report('gitlab', { state: errors.length ? 'error' : 'ready', detail: errors.length ? `${errors.length} GitLab reads failed; healthy objects continue polling`
+    : config.webhookEnabled ? 'GitLab webhook mode; active subscriptions reconciled' : 'GitLab project and subscriptions polled', at: started })
 }
 export const gitlabKind: SourceKind<GitlabConfig> = {
   kind: 'gitlab', title: { zh: 'GitLab', en: 'GitLab' }, description: { zh: '单项目 Issue、MR 与评审讨论；大项目的全量讨论轮询成本较高。', en: 'Single-project issues, MRs and discussions; full discussion scans can be expensive on large projects.' },
@@ -176,6 +298,8 @@ export const gitlabKind: SourceKind<GitlabConfig> = {
         : field === 'project' ? { zh: '例如 group/subgroup/repository，填写项目路径，不是完整 URL。', en: 'For example group/subgroup/repository: a project path, not a full URL.' }
           : { zh: '实例专用 glab 包装器的绝对路径；包装器读取该实例的私有令牌文件，不在此填写令牌。配置步骤见部署文档。', en: 'Absolute path to this instance\'s glab wrapper, which reads its private token file. Do not enter a token here. See the deployment guide.' } })),
     { key: 'pollSeconds', type: 'number', min: 30, max: 3600, label: { zh: '轮询间隔 / 秒', en: 'Poll seconds' }, advanced: true },
+    { key: 'webhookEnabled', type: 'switch', label: { zh: 'Webhook 接入', en: 'Webhook intake' }, advanced: true,
+      hint: { zh: '启用前配置项目 Webhook 和接收密钥。启用后至少间隔 15 分钟，仅补偿扫描活跃工单。', en: 'Configure the project webhook and receiver secret first. Reconciliation checks active tickets only, at intervals of at least 15 minutes.' } },
     ...(['receiveAllIssues', 'receiveAllMergeRequests', 'receiveAllComments'] as const).map(field => ({ key: field, type: 'switch' as const, label: { zh: field === 'receiveAllIssues' ? '接收全部 Issue' : field === 'receiveAllMergeRequests' ? '接收全部 MR' : '接收全部评论', en: field } })),
   ],
   scope: ({ meta }, config) => {
@@ -202,8 +326,19 @@ export const gitlabKind: SourceKind<GitlabConfig> = {
       ['issues', 'Issue', c.receiveAllIssues], ['mrs', 'MR', c.receiveAllMergeRequests], ['comments', '评论 / Comments', c.receiveAllComments],
     ].map(([id, label, all]) => ({ id: String(id), label: String(label), note: { zh: all ? '全部消息' : '仅 @', en: all ? 'All' : 'Mentions' }, cells: { listedUnaddressed: !!all, unlistedAddressed: true, unlistedUnaddressed: !!all } })) },
   },
-  environment: { variables: ['URL', 'PROJECT', 'AGENT', 'COMMIT_EMAIL'].map(name => ({ key: `DSH_SUPERAGENT_GITLAB_${name}`, description: { zh: `当前 GitLab ${name}`, en: `GitLab ${name}` } })),
-    values: ({ deployment }) => ({ DSH_SUPERAGENT_GITLAB_URL: deployment.gitlab?.baseUrl ?? '', DSH_SUPERAGENT_GITLAB_PROJECT: deployment.gitlab?.project ?? '', DSH_SUPERAGENT_GITLAB_AGENT: deployment.gitlab?.username ?? '', DSH_SUPERAGENT_GITLAB_COMMIT_EMAIL: deployment.gitlab?.email ?? '' }) },
+  environment: { variables: [
+    ...['URL', 'PROJECT', 'AGENT', 'COMMIT_EMAIL'].map(name => ({ key: `DSH_SUPERAGENT_GITLAB_${name}`, description: { zh: `当前 GitLab ${name}`, en: `GitLab ${name}` } })),
+    { key: 'DSH_SUPERAGENT_GITLAB_PROJECT_ID', description: { zh: '已绑定的 GitLab 项目数字 ID', en: 'Bound numeric GitLab project ID' } },
+    { key: 'DSH_SUPERAGENT_GITLAB_WORKTREE_MODE', description: { zh: '工作树准备模式：base、mr、resume 或 unknown', en: 'Worktree preparation mode: base, mr, resume, or unknown' } },
+    { key: 'DSH_SUPERAGENT_GITLAB_ORIGIN_MR_IID', description: { zh: '工单来源 MR 的项目内编号', en: 'Project-local IID of the ticket origin MR' } },
+  ], values: ({ deployment, ticket, trigger }) => {
+    const account = deployment.gitlab
+    const worktree = account && ticket ? gitlabWorktree(account, ticket, trigger) : undefined
+    return { DSH_SUPERAGENT_GITLAB_URL: account?.baseUrl ?? '', DSH_SUPERAGENT_GITLAB_PROJECT: account?.project ?? '',
+      DSH_SUPERAGENT_GITLAB_AGENT: account?.username ?? '', DSH_SUPERAGENT_GITLAB_COMMIT_EMAIL: account?.email ?? '',
+      DSH_SUPERAGENT_GITLAB_PROJECT_ID: String(account?.projectId ?? ''), DSH_SUPERAGENT_GITLAB_WORKTREE_MODE: worktree?.mode ?? '',
+      DSH_SUPERAGENT_GITLAB_ORIGIN_MR_IID: worktree?.mrIid ?? '' }
+  } },
   facts: (deployment): Record<string, string | { zh: string; en: string }> => deployment?.gitlab ? { cli: { zh: `当前账号 @${deployment.gitlab.username}；项目 ${deployment.gitlab.projectId}`, en: `Agent @${deployment.gitlab.username}; project ${deployment.gitlab.projectId}` } } : {},
 }
 /** Bind authorization to the resolved numeric project, keeping stored path labels rename-safe. */
@@ -233,7 +368,8 @@ export function apply(ctx: Context): void {
           if (config) { await pollGitlab(host, stop.signal); failures = 0 }
           else host.report('gitlab', { state: 'paused', detail: 'Source is off' })
         } catch { if (++failures >= 3 && !stop.signal.aborted) host.report('gitlab', { state: 'error', detail: 'GitLab reads failed repeatedly; check account, access and connectivity' }) }
-        await pause(Math.min(3600, (config?.pollSeconds ?? 60) * 2 ** Math.min(failures, 5)) * 1000, stop.signal)
+        const seconds = Math.max(config?.webhookEnabled ? 900 : 30, config?.pollSeconds ?? 60)
+        await pause(Math.min(3600, seconds * 2 ** Math.min(failures, 5)) * 1000, stop.signal)
       }
     }
     const running = run()

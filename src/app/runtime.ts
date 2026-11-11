@@ -30,6 +30,7 @@ import { TextCache } from './cache.ts'
 import { Effects } from './effects.ts'
 import { Prompts } from './prompts.ts'
 import { registerHttp, type HttpHost } from './http.ts'
+import { registerGitlabWebhook } from './gitlab-webhook.ts'
 import type { LinkTarget } from './views/records.ts'
 import { candidateCard, repliedTo, sourceLink, type LinkHost } from './links.ts'
 import { eventNotice, followupNotice } from './notices.ts'
@@ -126,7 +127,8 @@ export class Runtime extends Service implements SourceHost {
       const policyChanged: EngineForSettings['policyChanged'] = (from, to, effects) => { this.engine.policyChanged(from, to, effects) }
       this.settings = new Settings({ store, sources, engine: { policyChanged }, health: board, context: ctx, lifetime: this.lifetime, sessions,
         sourceHost: this, setup, repositoryProvider: machine.repositoryProvider, requestPass: () => { this.passes.request() } })
-      this.executor = new DshExecutor({ context: ctx, get engine() { return runtime.engine }, store, effects, health: board.claim('worker'), machine,
+      this.executor = new DshExecutor({ context: ctx, get engine() { return runtime.engine }, get gitlab() { return setup.deployment.gitlab },
+        store, commands, effects, health: board.claim('worker'), machine,
         lifetime: this.lifetime, sessions, closing: () => this.closing(), paused: () => this.paused(), environment, sourceLink: link,
         repliedTo: trigger => repliedTo({ store, sources }, trigger) })
       this.assessor = new MasterAssessor({ get engine() { return runtime.engine }, commands, get deployment() { return setup.deployment }, effects,
@@ -208,6 +210,7 @@ export class Runtime extends Service implements SourceHost {
   private async initialize(): Promise<void> {
     // Register management HTTP routes before setup completes so operators can fix setup problems in the UI.
     this.disposers.push(registerHttp(this.ctx, this.httpHost()))
+    if (this.machine.repositoryProvider === 'gitlab') this.disposers.push(registerGitlabWebhook(this.ctx, this))
     const configured = await this.setup.run(this.store.settings())
     if (this.closing()) return
     if (!configured) {

@@ -2,12 +2,13 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import type { Agent } from '@deepseek-ai/dsh-agent'
-import { mkdir, rmdir, stat } from 'node:fs/promises'
-import { dirname, join } from 'node:path'
+import { lstat, mkdir, readFile, realpath, rmdir, stat } from 'node:fs/promises'
+import { dirname, join, resolve } from 'node:path'
 import { key, latestAssignment, latestReport, liveTicket, runningAssignment, threadKey, waitsForPerson } from '../core/index.ts'
 import type { AssessmentOutcome, Assignment, EngineForExecutor, Execution, Executor, Mandate, PolicyEffect, Ticket, TicketInput, Trigger }
   from '../core/index.ts'
-import type { Machine } from '../deployment.ts'
+import type { GitlabAccount, Machine } from '../deployment.ts'
+import { CliError, type Commands } from '../infra/commands.ts'
 import { runAsWorker, verifyDirectory } from '../infra/environment.ts'
 import type { Settings } from '../policy.ts'
 import type { Store } from '../app/store.ts'
@@ -17,6 +18,9 @@ import type { Sessions } from '../app/sessions.ts'
 import { WorktreeNameSchema } from '../app/assessment.ts'
 import { resultRelay } from '../app/notices.ts'
 import type { HealthEntry } from '../infra/health.ts'
+import { gitlabThread, gitlabWorktree } from '../sources/gitlab-merge.ts'
+import { readMerge } from '../sources/gitlab-read.ts'
+import { KV } from '../kv.ts'
 import { cancelled, collectJob, killJobs, runningJobs, stopBackground, stopSubagents, until, untilQuiet } from './background.ts'
 
 const now = (): string => new Date().toISOString()
@@ -38,7 +42,7 @@ const SLOT_WAIT_MS = 5000
 const fromPerson = (input?: TicketInput): boolean => input?.kind === 'trigger' ? !!input.human && !input.context : input?.kind === 'text'
 /**
  * Internal error thrown when a ticket's workspace prepare command fails during launch.
- * DshExecutor catches it to mark the ticket failed immediately rather than retrying automatically, because an existing directory counts as prepared and an automatic retry would treat whatever a failed prepare command left behind in the directory as a prepared workspace.
+ * DshExecutor marks the ticket failed immediately so an operator can address the preparation error before retrying.
  */
 class PrepareFailed extends Error {}
 const PASSING = new RegExp(['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EAI_AGAIN', 'ENOTFOUND', 'EPIPE', 'UND_ERR', 'socket hang up', 'fetch failed',
@@ -62,12 +66,14 @@ export interface ExecutorHost {
   /** Where the Executor reports what happened to Assignments and Inputs. */
   readonly engine: Pick<EngineForExecutor, 'assignmentStarted' | 'inputsDelivered' | 'inputsRead' | 'turnEnded' | 'deliveryFailed' | 'report'
     | 'assignmentInterrupted'>
-  readonly store: Pick<Store, 'tickets' | 'triggers' | 'set' | 'settings' | 'atomic' | 'afterCommit'>
+  readonly store: Pick<Store, 'tickets' | 'triggers' | 'get' | 'set' | 'delete' | 'settings' | 'atomic' | 'afterCommit'>
+  readonly commands: Pick<Commands, 'withSignal'>
   /** Durable effect queue through which launches and input deliveries run. */
   readonly effects: Pick<Effects, 'enqueue' | 'handle'>
   /** The `worker` health entry, which reports whether background worker event handling failed. */
   readonly health: HealthEntry
   readonly machine: Pick<Machine, 'stateDir'>
+  readonly gitlab?: GitlabAccount
   readonly lifetime: AbortSignal
   /** Session manager for worker sessions and for relaying worker reports to the main Session. */
   readonly sessions: Pick<Sessions, 'ensure' | 'prompt' | 'promptedId' | 'relay' | 'holds'>
@@ -240,26 +246,85 @@ export class DshExecutor implements Executor {
     return { ...ticket, execution: ticketExecution(ticket, outcome, this.host.store.settings(), this.host.machine.stateDir) }
   }
   /**
-   * Runs the configured `executor.prepare` command for a new ticket workspace in its parent directory with the ticket's
+   * Runs the configured `executor.prepare` command in the workspace's parent directory with the ticket's
    * execution environment variables, then verifies the directory as the worker sees it.
    * A failed prepare command throws `PrepareFailed`, which is not retried automatically; an empty directory it left is removed, a non-empty one kept.
    * @throws PrepareFailed with the command's output when the prepare command fails.
    */
-  private async prepareDirectory(ticket: Ticket): Promise<void> {
-    const directory = ticket.execution?.directory ?? ''
-    await mkdir(dirname(directory), { recursive: true })
+  private async prepareDirectory(directory: string, env: Record<string, string>, existed: boolean, mode?: ReturnType<typeof gitlabWorktree>['mode']): Promise<void> {
     const command = this.host.store.settings().executor.prepare.trim()
-    const env = Object.fromEntries(this.host.environment(ticket).map(variable => [variable.key, variable.value]))
+    if (mode === 'unknown') {
+      throw new PrepareFailed('Cannot determine the GitLab ticket origin for workspace preparation')
+    }
+    if (!command && mode === 'mr') {
+      throw new PrepareFailed('GitLab MR-origin tickets require a Prepare command that verifies the MR baseline')
+    }
+    await mkdir(dirname(directory), { recursive: true })
     // Enforce a timeout so a hung prepare command (such as on a credential prompt) fails the ticket instead of holding a worker slot indefinitely.
     const signal = AbortSignal.any([this.host.lifetime, AbortSignal.timeout(PREPARE_TIMEOUT_MS)])
     if (command) await runAsWorker(this.host.context.subprocess, ['sh', '-c', command], dirname(directory), signal, env)
       .catch(async (error: unknown) => {
         // Remove an empty directory left by a failed prepare command so a later retry does not treat it as already prepared.
-        await rmdir(directory).catch(() => { /* Absent, or holding what the command wrote, which the output explains. */ })
+        if (!existed) await rmdir(directory).catch(() => { /* Absent, or holding what the command wrote, which the output explains. */ })
         throw new PrepareFailed(`The prepare command failed: ${error instanceof Error ? error.message : String(error)}`)
       })
     await mkdir(directory, { recursive: true })
     await verifyDirectory(directory, this.host.context.subprocess, this.host.lifetime)
+  }
+  private async verifyGitlabWorktree(ticket: Ticket, resume?: { allowLegacyBase: boolean }): Promise<void> {
+    const { directory = '', name = '' } = ticket.execution ?? {}
+    const dotGit = join(directory, '.git')
+    const signal = AbortSignal.any([this.host.lifetime, AbortSignal.timeout(60_000)])
+    const git = (...args: string[]) => runAsWorker(this.host.context.subprocess, ['git', ...args], directory, signal)
+    try {
+      if (!(await lstat(dotGit)).isFile()) throw new Error('Expected a linked worktree')
+      const gitDir = (await git('rev-parse', '--absolute-git-dir')).trim()
+      const backlink = (await readFile(join(gitDir, 'gitdir'), 'utf8')).trim()
+      if (!backlink || await realpath(resolve(gitDir, backlink)) !== await realpath(dotGit)) throw new Error('Wrong worktree')
+      const branch = (await git('symbolic-ref', 'HEAD')).trim()
+      let pin = `refs/dsh-superagent/bases/${ticket.id}`
+      let legacy = false
+      if (resume?.allowLegacyBase) {
+        // Only tickets with a known non-MR origin can reuse the old deployment's configured-base ref.
+        try { await git('show-ref', '--verify', '--quiet', pin) }
+        catch (error) {
+          if (!(error instanceof CliError) || error.exitCode !== 1) throw error
+          pin = `refs/dsh-superagent/${ticket.id}`
+          legacy = true
+        }
+      }
+      await git('merge-base', '--is-ancestor', `${pin}^{commit}`, 'HEAD')
+      if (legacy || branch !== `refs/heads/agent/${name}`) {
+        if (!resume || !await this.isBoundGitlabBranch(ticket, branch, signal)) throw new Error('Wrong ticket branch')
+      }
+    } catch {
+      throw new PrepareFailed('GitLab ticket workspace is not the pinned worktree on its ticket branch; check the Prepare command or restore the worktree')
+    }
+  }
+  private async isBoundGitlabBranch(ticket: Ticket, branch: string, signal: AbortSignal): Promise<boolean> {
+    const account = this.host.gitlab
+    if (!account || branch.split('/').at(-1) !== ticket.execution?.name) return false
+    const bound = ticket.follows?.filter(follow => {
+      const iid = Number(follow.thread.split(':').at(-1))
+      return follow.own && Number.isSafeInteger(iid) && iid > 0 &&
+        follow.thread === `gitlab:${gitlabThread(account.baseUrl, account.projectId, 'mr', iid)}`
+    })
+    const follow = bound?.findLast(item => !item.closed) ?? bound?.at(-1)
+    if (!follow) return false
+    const iid = Number(follow.thread.split(':').at(-1))
+    const mr = await readMerge(this.host.commands.withSignal(signal), iid)
+    return mr.iid === iid && mr.author.id === account.userId && mr.source_project_id === account.projectId &&
+      mr.target_project_id === account.projectId && branch === `refs/heads/${mr.source_branch}`
+  }
+  private async verifyResumeDirectory(ticket: Ticket): Promise<void> {
+    const account = this.host.gitlab
+    if (!account) return
+    const worktree = gitlabWorktree(account, ticket, sourceTrigger(this.host, ticket))
+    if (worktree.mode !== 'resume') return
+    if (!await stat(ticket.execution?.directory ?? '').then(info => info.isDirectory(), () => false)) {
+      throw new PrepareFailed('GitLab ticket workspace is missing; restore it before resuming the worker')
+    }
+    if (worktree.requirePin) await this.verifyGitlabWorktree(ticket, { allowLegacyBase: worktree.origin === 'base' })
   }
   /** Enqueues a `launch` effect for an accepted or resumed assignment; launches start in queue order as worker slots free up. */
   start(ticket: Ticket, assignment: Assignment): void {
@@ -276,9 +341,7 @@ export class DshExecutor implements Executor {
     try { await this.launch(ticket, assignment); this.transient.delete(`launch:${assignmentId}`) }
     catch (error) {
       // Shutdown or pause re-queues the launch for resume, and transient network/provider errors retry with backoff.
-      // A failed prepare command is not retried automatically because an existing directory counts as prepared, so retrying
-      // would treat whatever a failed prepare command left behind in the directory as a prepared workspace; instead the
-      // ticket is marked failed and waits until new human input or an explicit retry arrives.
+      // Preparation failures wait for human input or an explicit retry. A command can leave partial workspace state behind.
       if (this.host.closing() || error instanceof Later) throw error
       if (!(error instanceof PrepareFailed) && this.retries(`launch:${assignmentId}`, error)) throw error
       this.launchFailed(ticketId, assignmentId, error)
@@ -311,6 +374,7 @@ export class DshExecutor implements Executor {
         }
         const input = ticket.inputs.find(item => item.id === inputId)
         try {
+          await this.verifyResumeDirectory(ticket)
           // Recreate the worker session if it was externally deleted.
           if (!this.host.context.agents.get(sessionId as SessionId)) {
             await this.host.sessions.ensure(sessionId, ticket.execution?.directory ?? '', ticket.title, 'worker')
@@ -432,10 +496,27 @@ export class DshExecutor implements Executor {
     const source = sourceTrigger(this.host, ticket)
     const workspace = ticket.execution?.directory ?? ''
     if (!current()) return
-    // Prepare the workspace directory once; an existing directory counts as already prepared, including worktrees created before `prepare` commands existed.
-    if (!await stat(workspace).then(() => true, () => false)) {
-      await this.prepareDirectory(ticket)
-      if (!current()) return
+    const account = this.host.gitlab
+    const worktree = account && gitlabWorktree(account, ticket, source)
+    const mode = worktree?.mode
+    const existed = mode !== 'resume' && await stat(workspace).then(() => true, () => false)
+    const prepareKey = mode === 'base' ? KV.executor.gitlabBasePreparing(ticket.id) : undefined
+    const interrupted = prepareKey && this.host.store.get(prepareKey)
+    if (mode === 'resume') {
+      await this.verifyResumeDirectory(ticket)
+    } else if (!existed || interrupted || mode === 'mr' || mode === 'unknown') {
+      if (existed && interrupted && !this.host.store.settings().executor.prepare.trim()) {
+        throw new PrepareFailed('GitLab ticket workspace was left by an incomplete Prepare; configure Prepare or restore the workspace')
+      }
+      const env = Object.fromEntries(this.host.environment(ticket).map(variable => [variable.key, variable.value]))
+      if (account && worktree) Object.assign(env, {
+        DSH_SUPERAGENT_GITLAB_WORKTREE_MODE: worktree.mode, DSH_SUPERAGENT_GITLAB_ORIGIN_MR_IID: worktree.mrIid,
+        DSH_SUPERAGENT_GITLAB_URL: account.baseUrl, DSH_SUPERAGENT_GITLAB_PROJECT_ID: String(account.projectId),
+      })
+      if (prepareKey) this.host.store.set(prepareKey, true)
+      await this.prepareDirectory(workspace, env, existed, mode)
+      if (mode === 'mr') await this.verifyGitlabWorktree(ticket)
+      if (prepareKey) this.host.store.delete(prepareKey)
     }
     if (!current()) return
     const sessionId = workerSessionId(ticket.id)
@@ -557,10 +638,14 @@ export class DshExecutor implements Executor {
     const tries = this.transient.get(assignmentId)!
     const text = `Your last turn failed for a passing reason (${String(error).slice(0, 200)}). Continue the assignment where it stopped.`
     this.resuming.add(assignmentId)
+    const active = () => {
+      const ticket = this.host.store.tickets.get(ticketId)
+      return ticket && liveTicket(ticket) && runningAssignment(ticket)?.id === assignmentId ? ticket : undefined
+    }
     const go = () => {
       if (this.host.closing()) return
-      const ticket = this.host.store.tickets.get(ticketId)
-      if (!ticket || !liveTicket(ticket) || runningAssignment(ticket)?.id !== assignmentId) { this.resuming.delete(assignmentId); return }
+      const ticket = active()
+      if (!ticket) { this.resuming.delete(assignmentId); return }
       // Wait while processing is paused or no wake slot is free.
       if (this.host.paused()) { this.after(SLOT_WAIT_MS, go); return }
       const sessionId = workerSessionId(ticketId)
@@ -569,9 +654,12 @@ export class DshExecutor implements Executor {
         if (!(failure instanceof Later)) throw failure
         this.after(SLOT_WAIT_MS, go); return
       }
-      const sent = this.host.sessions.prompt(sessionId, `retry:${assignmentId}:${tries}`, text, 'queue')
+      const sent = this.verifyResumeDirectory(ticket)
+        .then(() => this.host.sessions.prompt(sessionId, `retry:${assignmentId}:${tries}`, text, 'queue', () => {
+          if (this.host.closing() || !active()) throw new Error('Assignment changed before worker retry')
+        }))
       void this.background(sent.finally(() => { if (waking) this.slots.free(ticketId); this.resuming.delete(assignmentId) })
-        .catch(failure => { this.failed(ticketId, String(failure)) }))
+        .catch(failure => { if (!this.host.closing() && active()) this.failed(ticketId, String(failure)) }))
     }
     this.after(TRANSIENT_BACKOFF_MS * 2 ** (tries - 1), go)
   }

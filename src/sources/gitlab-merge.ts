@@ -1,10 +1,28 @@
 /** MR ownership, lifecycle and model-facing delivery projection. */
-import { key, liveTicket, type Ticket, type Thread, type OutboundMessage } from '../core/index.ts'
+import { key, liveTicket, type Ticket, type Thread, type Trigger, type OutboundMessage } from '../core/index.ts'
+import type { GitlabAccount } from '../deployment.ts'
 import { ticketBranch } from './github-pull.ts'
 import type { SourceContext } from './host.ts'
 import type { GitlabObject } from './gitlab-read.ts'
 export function gitlabThread(instance: string, project: number, kind: 'issue' | 'mr', iid: number): string {
   return `${encodeURIComponent(instance)}:${project}:${kind}:${iid}`
+}
+/** Derive workspace policy from the bound account and stored ticket, independently of event intake. */
+export function gitlabWorktree(account: GitlabAccount, ticket: Pick<Ticket, 'assignments' | 'follows'>, trigger?: Trigger) {
+  let origin: 'unknown' | 'mr' | 'base' = trigger && trigger.source !== 'gitlab' ? 'base' : 'unknown'
+  let mrIid = ''
+  if (trigger?.source === 'gitlab') {
+    const { objectKind, iid, instance, projectId, fork } = trigger.meta
+    if (instance === account.baseUrl && projectId === account.projectId && !fork &&
+        (objectKind === 'issue' || objectKind === 'mr') && typeof iid === 'number' && Number.isSafeInteger(iid) && iid > 0 &&
+        trigger.threads.some(ref => ref.source === 'gitlab' && ref.id === gitlabThread(instance, projectId, objectKind, iid))) {
+      origin = objectKind === 'mr' ? 'mr' : 'base'
+      if (origin === 'mr') mrIid = String(iid)
+    }
+  }
+  const own = ticket.follows?.some(follow => follow.own && /^gitlab:.*:mr:\d+$/.test(follow.thread))
+  const resume = own || ticket.assignments.some(assignment => assignment.startedAt)
+  return { mode: resume ? 'resume' as const : origin, origin, mrIid, requirePin: origin !== 'base' || !!own }
 }
 export function mergeOf(ticket: Pick<Ticket, 'follows'>, thread?: (key: string) => Thread | undefined): { iid: number; url?: string } | undefined {
   const follows = ticket.follows?.filter(f => /^gitlab:.*:mr:\d+$/.test(f.thread)) ?? []

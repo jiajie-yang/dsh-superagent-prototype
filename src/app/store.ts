@@ -80,6 +80,8 @@ export class Store implements Repositories {
             CREATE TABLE IF NOT EXISTS effect (kind TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, seq INTEGER NOT NULL,
               generation INTEGER NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0, error TEXT NOT NULL DEFAULT '', due INTEGER NOT NULL,
               since TEXT NOT NULL, PRIMARY KEY (kind, key));
+            CREATE TABLE IF NOT EXISTS gitlab_hook_receipt (id TEXT PRIMARY KEY, received INTEGER NOT NULL);
+            CREATE INDEX IF NOT EXISTS gitlab_hook_received ON gitlab_hook_receipt(received);
             CREATE INDEX IF NOT EXISTS trigger_at ON trigger(at);
             CREATE INDEX IF NOT EXISTS trigger_thread_at ON trigger_thread(thread, at);
             CREATE INDEX IF NOT EXISTS decision_thread ON decision(thread);

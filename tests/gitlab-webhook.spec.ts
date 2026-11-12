@@ -104,7 +104,12 @@ it('acknowledges unsupported GitLab payloads without queuing them and rejects ma
 it('uses scoped API reads, keeps the discussion ID, deduplicates retries and treats edits as context', async () => {
   const h = await host()
   try {
-    const at = now(), object = issue(at)
+    const activation = Date.parse(h.runtime.store.settingsHistory()[0]!.savedAt)
+    const time = activation + 60_000, at = new Date(time).toISOString()
+    vi.spyOn(Date, 'now').mockReturnValue(time)
+    const object = issue(new Date(activation + 1_000).toISOString())
+    const markdownExample = '\n```markdown\n![Example](/uploads/example/image.png)\n```'
+    object.description = '![Screenshot [failed]](/uploads/abc/image(1).png)' + markdownExample
     const discussion = { id: 'd1', notes: [5, 6].map(id => ({
       id, body: '@agent-bot verified text', author, created_at: at, updated_at: at,
     })) }
@@ -115,12 +120,12 @@ it('uses scoped API reads, keeps the discussion ID, deduplicates retries and tre
       throw new Error(`Unexpected API read: ${endpoint}`)
     })
     const bodyHook = { object_kind: 'issue', project: { id: 42 }, object_attributes: { iid: 3, action: 'open',
-      author_id: author.id, title: object.title, description: object.description } }
+      author_id: author.id, title: object.title, description: '![Screenshot [failed]](https://gitlab.example.com/-/project/42/uploads/abc/image(1).png)' + markdownExample } }
     object.updated_at = new Date(Date.parse(at) + 1000).toISOString()
     await send(h, 'early-update', { ...bodyHook, object_attributes: { ...bodyHook.object_attributes, action: 'update' } })
     await h.runtime.idle()
     expect(gitlabTriggers(h).find(t => !t.meta.noteId)).toMatchObject({ human: false, meta: { contextOnly: true } })
-    // A baseline initialized after durable acceptance must not discard the queued opening.
+    // Even a later reconciliation baseline must not discard an opening after activation.
     h.runtime.store.set(KV.gitlab.baseline, new Date(Date.now() + 60_000).toISOString())
     expect(await send(h, 'open', bodyHook))
       .toMatchObject({ status: 200 })
@@ -128,7 +133,7 @@ it('uses scoped API reads, keeps the discussion ID, deduplicates retries and tre
     await send(h, 'duplicate-open-different-delivery', bodyHook)
     await h.runtime.idle()
     expect(gitlabTriggers(h).filter(t => !t.meta.noteId && t.human)).toEqual([
-      expect.objectContaining({ addressed: 'mention', text: '@agent-bot fix\ndescription' }),
+      expect.objectContaining({ addressed: 'mention', text: `@agent-bot fix\n${object.description}` }),
     ])
 
     const create = note(5, at)
@@ -151,6 +156,32 @@ it('uses scoped API reads, keeps the discussion ID, deduplicates retries and tre
     expect(triggers.find(t => t.meta.noteId === 6)?.addressed).toBeUndefined()
     expect([...new Set(read.mock.calls.map(([url]) => url))]).toEqual(['issues/3', 'issues/3/discussions?per_page=100&page=1', 'issues/3/discussions/d1'])
     expect(read.mock.calls.filter(([url]) => url.includes('?per_page='))).toHaveLength(1)
+  } finally { await h.stop() }
+})
+
+it('acknowledges GitLab test deliveries for history without admitting work', async () => {
+  const h = await host()
+  try {
+    const activation = Date.parse(h.runtime.store.settingsHistory()[0]!.savedAt)
+    const before = new Date(activation - 60_000).toISOString(), after = new Date(activation + 1_000).toISOString()
+    const object = issue(before)
+    const discussion = { id: 'd1', notes: [before, after].map((at, index) => ({
+      id: 5 + index, body: '@agent-bot fix', author, created_at: at, updated_at: at,
+    })) }
+    vi.spyOn(Commands.prototype, 'gitlab').mockImplementation(async endpoint => (endpoint === 'issues/3' ? object : discussion) as never)
+    const opening = { object_kind: 'issue', project: { id: 42 }, object_attributes: { iid: 3, action: 'open',
+      author_id: author.id, title: object.title, description: object.description } }
+    expect((await send(h, 'test-open', opening)).status).toBe(200)
+    expect((await send(h, 'test-note', note(5, before))).status).toBe(200)
+    await h.runtime.idle()
+    expect(h.runtime.health.gitlabWebhookReceiver?.state).toBe('ready')
+    expect(h.candidates()).toEqual([])
+    expect(gitlabTriggers(h).filter(trigger => trigger.human)).toEqual([])
+
+    expect((await send(h, 'new-note', note(6, after))).status).toBe(200)
+    await h.runtime.idle()
+    expect(h.candidates()).toHaveLength(1)
+    expect(gitlabTriggers(h).filter(trigger => trigger.human)).toMatchObject([{ addressed: 'mention', meta: { noteId: 6 } }])
   } finally { await h.stop() }
 })
 
@@ -236,7 +267,7 @@ it('reopens the durable inbox and backs off a rate-limited delivery without rese
     effects = new Effects(store, new HealthBoard())
     unmount = mount()
     const at = now()
-    const api = vi.spyOn(Commands.prototype, 'gitlab').mockRejectedValueOnce(new CliError('rate limited', 429))
+    const api = vi.spyOn(Commands.prototype, 'gitlab').mockRejectedValueOnce(new CliError('rate limited', 429, 1, 120_000))
       .mockImplementation(async endpoint => (endpoint === 'issues/3' ? issue(at) : { id: 'd1', notes: [{
         id: 5, body: '@agent-bot fix', author, created_at: at, updated_at: at,
       }] }) as never)
@@ -250,9 +281,40 @@ it('reopens the durable inbox and backs off a rate-limited delivery without rese
     store.db.exec("UPDATE effect SET due = 0 WHERE kind = 'gitlabWebhook'")
     await effects.idle()
     expect(api).toHaveBeenCalledTimes(1)
-    vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 31_000)
+    const time = Date.now(), clock = vi.spyOn(Date, 'now').mockReturnValue(time + 31_000)
+    await effects.idle()
+    expect(api).toHaveBeenCalledTimes(1)
+    clock.mockReturnValue(time + 121_000)
     await effects.idle()
     expect(effects.pending('gitlabWebhook')).toBe(false)
     expect(gitlabTriggers(h).filter(t => t.meta.noteId === 5)).toHaveLength(1)
   } finally { unmount?.(); await effects.drain(); store.close(); await h.stop() }
+})
+
+it('keeps a repeated API 404 visible and replays the original event after access is restored', async () => {
+  const h = await host()
+  try {
+    const at = now(), time = Date.now(), clock = vi.spyOn(Date, 'now').mockReturnValue(time)
+    const api = vi.spyOn(Commands.prototype, 'gitlab').mockRejectedValue(new CliError('not found', 404))
+    const payload = { object_kind: 'issue', project: { id: 42 }, object_attributes: { iid: 3, action: 'open' } }
+    expect((await send(h, 'replay', payload)).status).toBe(200)
+    await h.runtime.idle()
+    clock.mockReturnValue(time + 5_000)
+    await h.runtime.idle()
+    clock.mockReturnValue(time + 15_000)
+    await h.runtime.idle()
+    expect(h.runtime.health.gitlabWebhook).toMatchObject({ state: 'error', detail: expect.stringContaining('1 awaiting replay') })
+    expect(h.runtime.health.gitlabWebhook?.detail).toContain('Issue #3 (delivery replay)')
+    clock.mockReturnValue(time + 300_000)
+    await h.runtime.idle()
+    expect(api).toHaveBeenCalledTimes(3)
+
+    const receiver = h.runtime.health.gitlabWebhookReceiver
+    api.mockResolvedValue(issue(at))
+    expect((await send(h, 'replay', payload)).status).toBe(200)
+    await h.runtime.idle()
+    expect(gitlabTriggers(h)).toHaveLength(1)
+    expect(h.runtime.health.gitlabWebhook).toMatchObject({ state: 'ready', detail: 'Nothing waiting' })
+    expect(h.runtime.health.gitlabWebhookReceiver).toEqual(receiver)
+  } finally { await h.stop() }
 })

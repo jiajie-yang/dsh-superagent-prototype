@@ -99,9 +99,9 @@ function SourceRow({ source }: { source: SourceStatusRow }) {
   const { problem, dropped } = source
   const { dot, label: state } = sourceMark(t, source.state)
   const { received, filtered, lastAt } = source.stats
-  // Omit healthy parts and suppress per-part notes when a setup problem already explains why the Source is stopped.
+  // Show the receiver's test prompt and last delivery alongside Source problems.
   const notes = source.enabled && !problem && !setup?.problem ? source.health.filter(item => item.state === 'error'
-    || item.state === 'paused') : []
+    || item.state === 'paused' || item.name === 'gitlabWebhookReceiver') : []
   return <li className="dt-row">
     <Dot state={dot} label={state} />
     <div className="dt-row-main">

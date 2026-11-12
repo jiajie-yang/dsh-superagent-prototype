@@ -102,11 +102,45 @@ export interface GitlabHookEvent {
   kind: ObjectKind
   iid: number
   receivedAt: string
+  deliveryId?: string
   contextOnly?: true
   openHash?: string
   note?: { id: number; discussionId?: string; edit: boolean; mentioned: boolean; agentMerge: boolean }
 }
-export async function processGitlabHook(ctx: SourceContext, event: GitlabHookEvent, signal: AbortSignal): Promise<void> {
+
+/** Match GitLab's Webhook rendering of simple relative Markdown image URLs against the REST description. */
+function webhookDescription(text: string, origin: string, projectId: number): string {
+  const lines = text.split('\n')
+  const fence = /^``` *$/, htmlEnd = /^<\/[^>]+> *$/
+  const lastFence = lines.findLastIndex(line => fence.test(line)), lastHtmlEnd = lines.findLastIndex(line => htmlEnd.test(line))
+  let blockEnd: RegExp | undefined
+  return lines.map((line, index) => {
+    if (blockEnd) {
+      if (blockEnd.test(line)) blockEnd = undefined
+      return line
+    }
+    if (index < lastFence && line.startsWith('```')) blockEnd = fence
+    else if (index < lastHtmlEnd && /^<[^>]+> *$/.test(line)) blockEnd = htmlEnd
+    if (blockEnd) return line
+    // GitLab takes the first ]( and the first closing parenthesis after a nonempty destination.
+    const parts: string[] = []
+    let offset = 0
+    for (let image = line.indexOf('![', offset); image !== -1; image = line.indexOf('![', offset)) {
+      const destination = line.indexOf('](', image + 2)
+      if (destination === -1) break
+      const end = line.indexOf(')', destination + 3)
+      if (end === -1) break
+      const url = line.slice(destination + 2, end)
+      const relative = url.replace(/^\//, '')
+      const path = relative.startsWith('uploads') ? `/-/project/${projectId}/${relative}` : `/${relative}`
+      parts.push(line.slice(offset, destination + 2), /^(https?:)?\/\//.test(url) ? url : origin + path, ')')
+      offset = end + 1
+    }
+    return parts.length ? parts.join('') + line.slice(offset) : line
+  }).join('\n')
+}
+
+export async function processGitlabHook(ctx: SourceContext, event: GitlabHookEvent, activatedAt: string, signal: AbortSignal): Promise<void> {
   const config = ctx.config<GitlabConfig>('gitlab'), a = ctx.deployment.gitlab
   if (!config?.webhookEnabled || !a) throw new Error('GitLab webhook intake is off')
   const { kind, iid, note } = event
@@ -121,38 +155,39 @@ export async function processGitlabHook(ctx: SourceContext, event: GitlabHookEve
     signal.throwIfAborted()
     if (!ctx.config<GitlabConfig>('gitlab')?.webhookEnabled) throw new Error('GitLab webhook intake is off')
   }
-  try {
-    const object = kind === 'mr' ? await readMerge(commands, iid) : ObjectSchema.parse(await commands.gitlab(path))
+  const object = kind === 'mr' ? await readMerge(commands, iid) : ObjectSchema.parse(await commands.gitlab(path))
+  active()
+  if (object.iid !== iid) throw new Error('GitLab returned a different object')
+  if (kind === 'issue' && object.project_id !== undefined && object.project_id !== a.projectId) return
+  if (kind === 'mr' && (object.source_project_id !== a.projectId || object.target_project_id !== a.projectId)) return
+  if (kind === 'mr' && object.state === 'opened') observeMerge(ctx, object)
+  if (note) {
+    const discussion = await findHookDiscussion(ctx, commands, path, note.id, note.discussionId)
     active()
-    if (object.iid !== iid) throw new Error('GitLab returned a different object')
-    if (kind === 'issue' && object.project_id !== undefined && object.project_id !== a.projectId) return
-    if (kind === 'mr' && (object.source_project_id !== a.projectId || object.target_project_id !== a.projectId)) return
-    if (kind === 'mr' && object.state === 'opened') observeMerge(ctx, object)
-    if (note) {
-      const discussion = await findHookDiscussion(ctx, commands, path, note.id, note.discussionId)
-      active()
-      const entry = discussion.notes.find(item => item.id === note.id)!
-      if (!entry.system) await receiveNote(ctx, kind, object, entry, discussion.id, !subscribed(), note.edit)
-    } else {
-      const savedBaseline = ctx.state.get(KV.gitlab.baseline)
-      // An accepted event may outlive a restart before the first reconciliation initializes its baseline.
-      const baseline = savedBaseline && savedBaseline <= event.receivedAt ? savedBaseline : cursorAt(event.receivedAt)
-      if (kind === 'mr' && object.state !== 'opened' && boundMerge(ctx, id)) {
-        // A terminal delivery can arrive before a review comment. Read that MR's unseen discussions before closing its ticket.
-        await receiveObject(ctx, kind, object, ctx.state.get(KV.gitlab.cursor(id)) ?? ctx.threads.get(thread)?.createdAt ?? baseline, signal, false, true)
-        await refreshMergeLifecycle(ctx, commands, iid, active)
-      } else {
-        const confirmed = !event.contextOnly && object.state === 'opened' && (event.openHash === undefined
-          ? object.created_at === object.updated_at
-          : event.openHash === key(String(object.author.id), object.title, object.description ?? ''))
-        observeBody(ctx, kind, object, baseline, !confirmed, confirmed)
-      }
+    const entry = discussion.notes.find(item => item.id === note.id)!
+    if (!entry.system) {
+      const historical = Date.parse(entry.created_at) < Date.parse(activatedAt)
+      await receiveNote(ctx, kind, object, entry, discussion.id, !subscribed(), note.edit || historical)
     }
-    describeObject(ctx, id, kind, object)
-  } catch (error) {
-    // An object or note removed before processing no longer authorizes work.
-    if (!(error instanceof CliError) || error.code !== 404) throw error
+  } else {
+    const savedBaseline = ctx.state.get(KV.gitlab.baseline)
+    const baseline = savedBaseline && savedBaseline <= event.receivedAt ? savedBaseline : cursorAt(event.receivedAt)
+    if (kind === 'mr' && object.state !== 'opened' && boundMerge(ctx, id)) {
+      // A terminal delivery can arrive before a review comment. Read that MR's unseen discussions before closing its ticket.
+      await receiveObject(ctx, kind, object, ctx.state.get(KV.gitlab.cursor(id)) ?? ctx.threads.get(thread)?.createdAt ?? baseline, signal, false, true)
+      await refreshMergeLifecycle(ctx, commands, iid, active)
+    } else {
+      const description = object.description ?? ''
+      const author = String(object.author.id)
+      const confirmed = !event.contextOnly && object.state === 'opened' && (event.openHash === undefined
+        ? object.created_at === object.updated_at
+        : event.openHash === key(author, object.title, description)
+          || event.openHash === key(author, object.title, webhookDescription(description, a.baseUrl, a.projectId)))
+      // GitLab's test button can synthesize an open event from an existing object.
+      observeBody(ctx, kind, object, confirmed ? activatedAt : baseline, !confirmed, confirmed)
+    }
   }
+  describeObject(ctx, id, kind, object)
 }
 // Cache routing only. Every note's current content and author still come from a fresh API read.
 const discussionHints = new WeakMap<SourceContext['commands'], Map<string, string>>()

@@ -185,6 +185,9 @@ it('reports failures as CliError with the code the CLI names and the exit status
   const notFound = commandError({ stderr: 'gh: Not Found (HTTP 404)\n', code: 1 })
   expect(notFound).toBeInstanceOf(CliError)
   expect(notFound).toMatchObject({ message: 'gh: Not Found (HTTP 404)', code: 404, exitCode: 1 })
+  expect(commandError({ stderr: 'glab: Rate limited (HTTP 429)\n', code: 1,
+    stdout: 'HTTP/2.0 429 Too Many Requests\r\nRetry-After: 120\r\n\r\n{}' }))
+    .toMatchObject({ code: 429, retryAfterMs: 120_000 })
   expect(commandError({ stderr: JSON.stringify({ error: { code: 230011, message: 'The message is recalled' } }),
     code: 1 })).toMatchObject({ message: 'The message is recalled (230011)', code: 230011 })
   // A cancelled command stays an AbortError so callers can distinguish cancellation from failure.

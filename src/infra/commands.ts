@@ -22,19 +22,20 @@ export function commandError(error: unknown, program = 'command'): Error {
   const exitCode = error && typeof error === 'object' && 'code' in error && typeof error.code === 'number' ? error.code : undefined
   if (error && typeof error === 'object' && 'stderr' in error && typeof error.stderr === 'string') {
     const stderr = error.stderr.trim()
+    const headers = 'stdout' in error && typeof error.stdout === 'string' ? RESPONSE_HEADERS.exec(error.stdout)?.[0] : undefined
+    const responseStatus = Number(/^HTTP\/\S+ (\d{3})\b/.exec(headers ?? '')?.[1]) || undefined
     let parsed: { error?: { code?: number; message?: string } } | undefined
     try { parsed = JSON.parse(stderr.slice(stderr.indexOf('{'))) as typeof parsed }
     catch { /* Non-JSON CLI diagnostics are retained below. */ }
     const code = parsed?.error?.code
-    if (parsed?.error?.message) return new CliError(`${parsed.error.message}${code ? ` (${code})` : ''}`, code, exitCode)
+    if (!responseStatus && parsed?.error?.message) return new CliError(`${parsed.error.message}${code ? ` (${code})` : ''}`, code, exitCode)
     // `gh` exits non-zero on HTTP errors (such as `gh: Not Found (HTTP 404)`) and on `gh: HTTP 304`, which ETag polling relies on.
-    if (stderr) {
-      const status = Number(/\bHTTP (\d{3})\b/.exec(stderr)?.[1]) || undefined
-      const headers = status === 429 && 'stdout' in error && typeof error.stdout === 'string' ? RESPONSE_HEADERS.exec(error.stdout)?.[0] : undefined
-      const retryAfter = headers && /^Retry-After:[ \t]*([^\r\n]+)/im.exec(headers)?.[1]?.trim()
+    if (stderr || responseStatus) {
+      const status = responseStatus ?? (Number(/\bHTTP (\d{3})\b/.exec(stderr)?.[1]) || undefined)
+      const retryAfter = status === 429 ? /^Retry-After:[ \t]*([^\r\n]+)/im.exec(headers ?? '')?.[1]?.trim() : undefined
       const retryDate = retryAfter?.endsWith(' GMT') ? Date.parse(retryAfter) : NaN
       const delay = retryAfter && /^\d+$/.test(retryAfter) ? Number(retryAfter) * 1000 : Math.max(0, retryDate - Date.now())
-      return new CliError(stderr.slice(0, 2000), status, exitCode, Number.isSafeInteger(delay) ? delay : undefined)
+      return new CliError(stderr.slice(0, 2000) || `HTTP ${status}`, status, exitCode, Number.isSafeInteger(delay) ? delay : undefined)
     }
   }
   return new CliError(`${basename(program)} ${ended(error)}`, undefined, exitCode)

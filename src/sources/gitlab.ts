@@ -68,14 +68,18 @@ export function observeBody(ctx: SourceContext, kind: ObjectKind, object: Gitlab
     ctx.state.set(stateKey, { hash, revision, updatedAt: object.updated_at })
   })
 }
-async function receiveObject(ctx: SourceContext, kind: ObjectKind, object: GitlabObject, since: string, signal?: AbortSignal, projectScan = false, contextOnly = false): Promise<void> {
+function beforeActivation(createdAt: string, activatedAt?: string): boolean {
+  return activatedAt !== undefined && Date.parse(createdAt) < Date.parse(activatedAt)
+}
+
+async function receiveObject(ctx: SourceContext, kind: ObjectKind, object: GitlabObject, since: string, signal?: AbortSignal, projectScan = false, contextOnly = false, activatedAt?: string): Promise<void> {
   const commands = gitlabEventReads(ctx.commands, signal)
   observeBody(ctx, kind, object, since, contextOnly)
   const discussions = await gitlabPages(commands, DiscussionSchema, `${objectPath(kind, object.iid)}/discussions`)
   for (const d of discussions) for (const note of d.notes) {
     signal?.throwIfAborted()
     if (!ctx.config('gitlab')) throw new Error('GitLab poll stopped')
-    if (note.system || Date.parse(note.updated_at) < Date.parse(since)) continue
+    if (note.system || Date.parse(note.updated_at) < Date.parse(since) || beforeActivation(note.created_at, activatedAt)) continue
     await receiveNote(ctx, kind, object, note, d.id, projectScan)
   }
 }
@@ -140,9 +144,10 @@ function webhookDescription(text: string, origin: string, projectId: number): st
   }).join('\n')
 }
 
-export async function processGitlabHook(ctx: SourceContext, event: GitlabHookEvent, activatedAt: string, signal: AbortSignal): Promise<void> {
+export async function processGitlabHook(ctx: SourceContext, event: GitlabHookEvent, signal: AbortSignal): Promise<void> {
   const config = ctx.config<GitlabConfig>('gitlab'), a = ctx.deployment.gitlab
   if (!config?.webhookEnabled || !a) throw new Error('GitLab webhook intake is off')
+  const activatedAt = ctx.gitlabWebhookActivatedAt?.() ?? event.receivedAt
   const { kind, iid, note } = event
   const id = gitlabThread(a.baseUrl, a.projectId, kind, iid), thread = `gitlab:${id}`
   const subscribed = () => {
@@ -165,16 +170,15 @@ export async function processGitlabHook(ctx: SourceContext, event: GitlabHookEve
     const discussion = await findHookDiscussion(ctx, commands, path, note.id, note.discussionId)
     active()
     const entry = discussion.notes.find(item => item.id === note.id)!
-    if (!entry.system) {
-      const historical = Date.parse(entry.created_at) < Date.parse(activatedAt)
-      await receiveNote(ctx, kind, object, entry, discussion.id, !subscribed(), note.edit || historical)
+    if (!entry.system && !beforeActivation(entry.created_at, activatedAt)) {
+      await receiveNote(ctx, kind, object, entry, discussion.id, !subscribed(), note.edit)
     }
   } else {
     const savedBaseline = ctx.state.get(KV.gitlab.baseline)
     const baseline = savedBaseline && savedBaseline <= event.receivedAt ? savedBaseline : cursorAt(event.receivedAt)
     if (kind === 'mr' && object.state !== 'opened' && boundMerge(ctx, id)) {
       // A terminal delivery can arrive before a review comment. Read that MR's unseen discussions before closing its ticket.
-      await receiveObject(ctx, kind, object, ctx.state.get(KV.gitlab.cursor(id)) ?? ctx.threads.get(thread)?.createdAt ?? baseline, signal, false, true)
+      await receiveObject(ctx, kind, object, ctx.state.get(KV.gitlab.cursor(id)) ?? ctx.threads.get(thread)?.createdAt ?? baseline, signal, false, true, activatedAt)
       await refreshMergeLifecycle(ctx, commands, iid, active)
     } else {
       const description = object.description ?? ''
@@ -245,6 +249,7 @@ export async function pollGitlab(ctx: SourceContext, signal?: AbortSignal): Prom
   if (!ctx.state.get(KV.gitlab.since)) ctx.state.set(KV.gitlab.since, since)
   const baseline = ctx.state.get(KV.gitlab.baseline) ?? since
   if (!ctx.state.get(KV.gitlab.baseline)) ctx.state.set(KV.gitlab.baseline, baseline)
+  const activatedAt = config.webhookEnabled ? ctx.gitlabWebhookActivatedAt?.() ?? started : undefined
   const commands = gitlabEventReads(ctx.commands, signal)
   const visited = new Set<string>()
   const errors: unknown[] = []
@@ -280,7 +285,7 @@ export async function pollGitlab(ctx: SourceContext, signal?: AbortSignal): Prom
     if (openedMerge) observeMerge(ctx, object)
     // Intake precedes closure. A discussion failure must not hide validated lifecycle state.
     try {
-      await receiveObject(ctx, kind, object, ctx.state.get(KV.gitlab.cursor(id)) ?? baseline, signal, projectScan && !(openedMerge && bound(id)))
+      await receiveObject(ctx, kind, object, ctx.state.get(KV.gitlab.cursor(id)) ?? baseline, signal, projectScan && !(openedMerge && bound(id)), false, activatedAt)
     } catch (error) {
       active()
       if (kind === 'mr' && !openedMerge && !config.webhookEnabled) observeMerge(ctx, object)

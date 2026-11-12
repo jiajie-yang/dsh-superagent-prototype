@@ -199,6 +199,14 @@ export class Store implements Repositories {
   }
   /** Saved settings revisions, newest first; revisions predating settings history are absent. */
   settingsHistory(limit = 20): SettingsVersion[] { return this.settingsVersions.list(limit) }
+  private webhookActivatedAt?: string
+  /** The first enabled webhook configuration is the cutoff for historical GitLab events. */
+  gitlabWebhookActivatedAt(): string | undefined {
+    return this.webhookActivatedAt ??= this.settingsHistory(Infinity).findLast(({ settings }) => {
+      const gitlab = settings.sources.gitlab
+      return gitlab?.enabled && gitlab.config.webhookEnabled === true
+    })?.savedAt
+  }
 
   readonly triggers = {
     get: (id: string): Trigger | undefined => { const row = this.db.prepare('SELECT value FROM trigger WHERE id=?').get(id); return row ? JSON.parse(String(row.value)) as Trigger : undefined },

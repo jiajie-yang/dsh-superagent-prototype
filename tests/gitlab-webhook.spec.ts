@@ -8,6 +8,7 @@ import { Store } from '../src/app/store.ts'
 import { CliError, Commands } from '../src/infra/commands.ts'
 import { HealthBoard } from '../src/infra/health.ts'
 import { KV } from '../src/kv.ts'
+import { gitlabThread } from '../src/sources/gitlab-merge.ts'
 import { gitlabKind, pollGitlab } from '../src/sources/gitlab.ts'
 import { feishu, startRuntime, type Host } from './fixtures/host.ts'
 
@@ -196,20 +197,28 @@ it('reconciles active tickets only and reads current MR state before applying a 
     const { ticket, sessionId } = await h.acceptedTicket(feishu('3', 'fix this'))
     const merge = { ...issue(at), author: { id: 7, username: 'agent-bot' }, source_project_id: 42, target_project_id: 42,
       source_branch: `agent/${ticket.execution!.name}`, web_url: 'https://gitlab.example.com/acme/widgets/-/merge_requests/3' }
+    const activation = Date.parse(h.runtime.store.settingsHistory()[0]!.savedAt)
+    const before = new Date(activation - 1000).toISOString()
+    const cursor = KV.gitlab.cursor(gitlabThread('https://gitlab.example.com', 42, 'mr', 3))
+    const resetCursor = () => h.runtime.store.set(cursor, new Date(activation - 2000).toISOString())
+    const historicalNote = (id: number) => ({ id, body: '@agent-bot historical', author, created_at: before, updated_at: before })
+    let notes = [historicalNote(51)]
     let remote = merge
     let reopenDuringCatchup = false
     read.mockImplementation(async endpoint => {
       if (endpoint === 'merge_requests/3') return remote as never
       if (endpoint === 'merge_requests/3/discussions?per_page=100&page=1') {
         if (reopenDuringCatchup) remote = merge
-        return [] as never
+        return [{ id: "d1", notes }] as never
       }
       throw new Error(`Unexpected API read: ${endpoint}`)
     })
     await h.runTool(sessionId, 'orchestrator_report', { state: 'ready', summary: 'ready', mr_iid: 3 })
+    resetCursor()
     read.mockClear()
     await pollGitlab(source)
     expect(read.mock.calls.map(([url]) => url)).toEqual(['merge_requests/3', 'merge_requests/3/discussions?per_page=100&page=1'])
+    expect(gitlabTriggers(h).find(t => t.meta.noteId === 51)).toBeUndefined()
     const event = { object_kind: 'merge_request', project: { id: 42 }, object_attributes: { iid: 3, action: 'merge' } }
     read.mockRejectedValueOnce(new CliError('rate limited', 429))
     await send(h, '429', event); await h.runtime.idle()
@@ -227,8 +236,11 @@ it('reconciles active tickets only and reads current MR state before applying a 
     await send(h, 'stale-close', event); await h.runtime.idle()
     expect(h.runtime.store.tickets.get(ticket.id)?.ended).toBeUndefined()
     remote = { ...merge, state: 'merged' }; reopenDuringCatchup = false
+    resetCursor()
+    notes = [historicalNote(52)]
     await send(h, 'merge', event); await h.runtime.idle()
     expect(h.runtime.store.tickets.get(ticket.id)?.ended?.outcome).toBe('merged')
+    expect(gitlabTriggers(h).find(t => t.meta.noteId === 52)).toBeUndefined()
     await send(h, 'old-open', { ...event, object_attributes: { iid: 3, action: 'open' } }); await h.runtime.idle()
     expect(h.runtime.store.tickets.get(ticket.id)?.ended?.outcome).toBe('merged')
   } finally { await h.stop() }

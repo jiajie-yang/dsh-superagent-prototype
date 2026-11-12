@@ -99,15 +99,9 @@ export function registerGitlabWebhook(ctx: Context, host: WebhookHost, health: H
   const { store, effects, lifetime } = host
   const source = () => host.context(gitlabKind)
   const enabled = (source: SourceContext) => !lifetime.aborted && source.configured() && !!source.config<GitlabConfig>('gitlab')?.webhookEnabled
-  let activatedAt: string | undefined
   effects.handle('gitlabWebhook', async (event, receipt) => {
-    // Settings history survives restarts and is independent of reconciliation or delivery timing.
-    activatedAt ??= store.settingsHistory(Infinity).findLast(({ settings }) => {
-      const gitlab = settings.sources.gitlab
-      return gitlab?.enabled && gitlab.config.webhookEnabled === true
-    })?.savedAt ?? event.receivedAt
     try {
-      await processGitlabHook(source(), event, activatedAt, lifetime)
+      await processGitlabHook(source(), event, lifetime)
     } catch (error) {
       if (!(error instanceof CliError) || error.code !== 404) throw error
       const target = `${event.kind === 'issue' ? 'Issue #' : 'MR !'}${event.iid}${event.note ? ` comment #${event.note.id}` : ''}`

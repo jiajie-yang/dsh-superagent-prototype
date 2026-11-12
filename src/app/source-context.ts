@@ -9,7 +9,7 @@ import type { Outbox } from './outbox.ts'
 import type { Store } from './store.ts'
 
 export interface SourceContextDeps {
-  readonly store: Pick<Store, 'atomic' | 'get' | 'set' | 'delete' | 'keys' | 'threads' | 'tickets' | 'triggers' | 'read'>
+  readonly store: Pick<Store, 'atomic' | 'get' | 'set' | 'delete' | 'keys' | 'threads' | 'tickets' | 'triggers' | 'read' | 'gitlabWebhookActivatedAt'>
   readonly outbox: Pick<Outbox, 'send'>
   readonly engine: Pick<EngineForSources, 'bindThread' | 'threadClosed'>
   readonly commands: Commands
@@ -38,6 +38,7 @@ export function sourceContextOf(deps: SourceContextDeps, kind: { kind: string; h
     commands: deps.commands,
     ready: deps.ready,
     configured: () => deps.configured(),
+    gitlabWebhookActivatedAt: () => store.gitlabWebhookActivatedAt(),
     get problem() { return [deps.feishuProblem, deps.setupProblem].find(problem => problem?.place === kind.kind) },
     config: <C extends Record<string, unknown>>(id: string) => {
       const instance = deps.sources.instance<C>(id)

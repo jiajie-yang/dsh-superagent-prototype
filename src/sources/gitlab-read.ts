@@ -31,9 +31,12 @@ export function gitlabEventReads(commands: Commands, signal?: AbortSignal): Gitl
   const scoped = commands.withSignal(signal)
   return { async gitlab<T>(path: string): Promise<T> {
     if (gitlabCoolingDown(commands)) throw new CliError('GitLab event reads are cooling down', 429)
-    try { return await scoped.gitlab<T>(path) }
+    try { return await scoped.gitlab<T>(path, 'GET', undefined, true) }
     catch (error) {
-      if (error instanceof CliError && error.code === 429) coolingUntil.set(commands, Date.now() + 30_000)
+      if (error instanceof CliError && error.code === 429) {
+        const until = Date.now() + (error.retryAfterMs ?? 30_000)
+        coolingUntil.set(commands, Math.max(coolingUntil.get(commands) ?? 0, until))
+      }
       throw error
     }
   } }

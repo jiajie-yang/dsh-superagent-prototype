@@ -10,6 +10,7 @@ import type { GitlabAccount } from '../deployment.ts'
 import { gitlabKind, gitlabMention, processGitlabHook, type GitlabConfig, type GitlabHookEvent } from '../sources/gitlab.ts'
 import { gitlabCoolingDown } from '../sources/gitlab-read.ts'
 import type { SourceContext } from '../sources/host.ts'
+import { CliError } from '../infra/commands.ts'
 import type { HealthEntry } from '../infra/health.ts'
 import type { Effects } from './effects.ts'
 import type { Store } from './store.ts'
@@ -98,11 +99,22 @@ export function registerGitlabWebhook(ctx: Context, host: WebhookHost, health: H
   const { store, effects, lifetime } = host
   const source = () => host.context(gitlabKind)
   const enabled = (source: SourceContext) => !lifetime.aborted && source.configured() && !!source.config<GitlabConfig>('gitlab')?.webhookEnabled
-  effects.handle('gitlabWebhook', event => processGitlabHook(source(), event, lifetime), {
+  effects.handle('gitlabWebhook', async (event, receipt) => {
+    try {
+      await processGitlabHook(source(), event, lifetime)
+    } catch (error) {
+      if (!(error instanceof CliError) || error.code !== 404) throw error
+      const target = `${event.kind === 'issue' ? 'Issue #' : 'MR !'}${event.iid}${event.note ? ` comment #${event.note.id}` : ''}`
+      const delivery = event.deliveryId ? `delivery ${event.deliveryId}` : `receipt ${receipt}`
+      throw new CliError(`${target} (${delivery}): ${error.message}`, error.code, error.exitCode)
+    }
+  }, {
     limit: () => {
       const current = source()
       return enabled(current) && !gitlabCoolingDown(current.commands) ? 1 : 0
     }, retry: [5000, 300_000],
+    // GitLab uses 404 for both missing objects and insufficient access.
+    parkAfter: (error, attempts) => error instanceof CliError && error.code === 404 && attempts >= 3,
   })
   const tokenPath = join(host.machine.stateDir, 'gitlab-webhook-token')
   function refreshHealth() {
@@ -162,11 +174,16 @@ export function registerGitlabWebhook(ctx: Context, host: WebhookHost, health: H
     if (!enabled(current)) return reply(res, 503)
     const delivery = header(req, 'webhook-id') || header(req, 'idempotency-key')
     const receipt = key('gitlab-hook', account.baseUrl, String(account.projectId), delivery && delivery.length <= 256 ? delivery : key(raw))
+    if (delivery && /^[a-zA-Z0-9_.:-]{1,256}$/.test(delivery)) event.deliveryId = delivery
     try {
       const recorded = store.atomic(() => {
-        if (now >= pruneAt) store.db.prepare('DELETE FROM gitlab_hook_receipt WHERE received < ?').run(now - RETENTION)
+        if (now >= pruneAt) {
+          store.db.prepare('DELETE FROM gitlab_hook_receipt WHERE received < ?').run(now - RETENTION)
+          effects.pruneParked('gitlabWebhook', new Date(now - RETENTION).toISOString())
+        }
         const inserted = store.db.prepare('INSERT OR IGNORE INTO gitlab_hook_receipt (id, received) VALUES (?, ?)').run(receipt, now)
         if (inserted.changes && !effects.pending('gitlabWebhook', receipt)) effects.enqueue('gitlabWebhook', receipt, event)
+        else effects.replayParked('gitlabWebhook', receipt)
         return inserted.changes > 0
       })
       if (now >= pruneAt) pruneAt = now + DAY

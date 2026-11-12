@@ -8,12 +8,13 @@ import type { Deployment } from '../deployment.ts'
 
 const exec = promisify(execFile)
 const TIMEOUT_MS = 90_000
+const RESPONSE_HEADERS = /^HTTP\/[^\r\n]+\r?\n(?:[^\r\n]+\r?\n)*\r?\n/
 /**
  * Error thrown by Commands when a CLI invocation fails, capturing stderr diagnostics, API error codes, and exit status without echoing command arguments.
  * Source channels and pollers inspect its code to distinguish deleted conversations from retryable failures.
  */
 export class CliError extends Error {
-  constructor(message: string, readonly code?: number, readonly exitCode?: number) { super(message) }
+  constructor(message: string, readonly code?: number, readonly exitCode?: number, readonly retryAfterMs?: number) { super(message) }
 }
 /** Extracts a sanitized error from a failed subprocess without echoing argv, which may contain message text. */
 export function commandError(error: unknown, program = 'command'): Error {
@@ -21,13 +22,21 @@ export function commandError(error: unknown, program = 'command'): Error {
   const exitCode = error && typeof error === 'object' && 'code' in error && typeof error.code === 'number' ? error.code : undefined
   if (error && typeof error === 'object' && 'stderr' in error && typeof error.stderr === 'string') {
     const stderr = error.stderr.trim()
+    const headers = 'stdout' in error && typeof error.stdout === 'string' ? RESPONSE_HEADERS.exec(error.stdout)?.[0] : undefined
+    const responseStatus = Number(/^HTTP\/\S+ (\d{3})\b/.exec(headers ?? '')?.[1]) || undefined
     let parsed: { error?: { code?: number; message?: string } } | undefined
     try { parsed = JSON.parse(stderr.slice(stderr.indexOf('{'))) as typeof parsed }
     catch { /* Non-JSON CLI diagnostics are retained below. */ }
     const code = parsed?.error?.code
-    if (parsed?.error?.message) return new CliError(`${parsed.error.message}${code ? ` (${code})` : ''}`, code, exitCode)
+    if (!responseStatus && parsed?.error?.message) return new CliError(`${parsed.error.message}${code ? ` (${code})` : ''}`, code, exitCode)
     // `gh` exits non-zero on HTTP errors (such as `gh: Not Found (HTTP 404)`) and on `gh: HTTP 304`, which ETag polling relies on.
-    if (stderr) return new CliError(stderr.slice(0, 2000), Number(/\bHTTP (\d{3})\b/.exec(stderr)?.[1]) || undefined, exitCode)
+    if (stderr || responseStatus) {
+      const status = responseStatus ?? (Number(/\bHTTP (\d{3})\b/.exec(stderr)?.[1]) || undefined)
+      const retryAfter = status === 429 ? /^Retry-After:[ \t]*([^\r\n]+)/im.exec(headers ?? '')?.[1]?.trim() : undefined
+      const retryDate = retryAfter?.endsWith(' GMT') ? Date.parse(retryAfter) : NaN
+      const delay = retryAfter && /^\d+$/.test(retryAfter) ? Number(retryAfter) * 1000 : Math.max(0, retryDate - Date.now())
+      return new CliError(stderr.slice(0, 2000) || `HTTP ${status}`, status, exitCode, Number.isSafeInteger(delay) ? delay : undefined)
+    }
   }
   return new CliError(`${basename(program)} ${ended(error)}`, undefined, exitCode)
 }
@@ -99,13 +108,15 @@ export class Commands {
     return path ? `repos/${this.repository}/${path}` : `repos/${this.repository}`
   }
   /** Calls only the configured GitLab instance and project; never accepts arbitrary URLs. */
-  async gitlab<T>(path: string, method = 'GET', fields?: Record<string, string>): Promise<T> {
+  async gitlab<T>(path: string, method = 'GET', fields?: Record<string, string>, includeHeaders = false): Promise<T> {
     const account = this.deployment.gitlab
     if (!account) throw new Error('GitLab is not configured')
     if (!/^[a-zA-Z0-9_/?=&%.\-]*$/.test(path) || /(^|\/)\.\.?(\/|$)/.test(path) || path.startsWith('/')) throw new Error('Invalid GitLab resource')
     const args = ['api', '--hostname', account.host, `projects/${account.projectId}${path ? '/' + path : ''}`, '--method', method]
+    if (includeHeaders) args.push('--include')
     for (const [name, value] of Object.entries(fields ?? {})) args.push('--raw-field', `${name}=${value}`)
-    return JSON.parse(await this.run(account.cli, args)) as T
+    const output = await this.run(account.cli, args)
+    return JSON.parse(includeHeaders ? output.replace(RESPONSE_HEADERS, '') : output) as T
   }
   /**
    * Runs the Feishu bot's `lark-cli` and returns the JSON `data` payload.

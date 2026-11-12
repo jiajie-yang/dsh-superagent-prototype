@@ -34,6 +34,8 @@ export interface SourceContext {
   readonly ready: Promise<void>
   /** True once setup resolved the repository and accounts; Sources poll only then. */
   configured(): boolean
+  /** First recorded activation of GitLab webhook intake. */
+  gitlabWebhookActivatedAt?(): string | undefined
   /** Setup problem keeping this Source's account from running; only the Feishu bot check reports one. */
   readonly problem?: SetupProblem | undefined
   /** Whether this source explicitly lists an actor as an automated sender. */
